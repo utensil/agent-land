@@ -220,3 +220,6 @@ __marimo__/
 
 # LangGraph
 .langgraph_api/
+
+# uv entries
+uv.lock
