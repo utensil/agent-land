@@ -5,7 +5,7 @@ A production-ready LangGraph agent that automatically generates comprehensive in
 ## Features
 
 - **Structured Input Processing**: Accepts date, company, and incident description
-- **Intelligent Web Search**: Tavily-powered search with caching for cost optimization
+- **Intelligent Web Search**: Brave Search API (default) with Tavily fallback and caching
 - **Structured Data Extraction**: Pydantic models for consistent metadata parsing
 - **Timeline Construction**: Chronological event sequencing from multiple sources
 - **Root Cause Analysis**: Structured incident reports following industry templates
@@ -20,7 +20,8 @@ A production-ready LangGraph agent that automatically generates comprehensive in
 
 ```mermaid
 graph TD
-    START([Start]) --> search[Search Node]
+    START([Start]) --> parse[Parse Node]
+    parse --> search[Search Node]
     search --> extract[Extract Node]
     extract --> generate[Generate Node]
     generate --> review[Review Node]
@@ -28,6 +29,7 @@ graph TD
     decision -->|Approved or Max Iterations| END([End])
     decision -->|Needs Improvement| search
     
+    parse --> nlp[Natural Language Processing]
     extract --> metadata[Extract Metadata]
     extract --> timeline[Build Timeline]
 ```
@@ -102,11 +104,13 @@ cp .env.example .env
 ```bash
 # Required API Keys
 OPENAI_API_KEY=your-openai-api-key-here
-TAVILY_API_KEY=your-tavily-api-key-here
+BRAVE_API_KEY=your-brave-api-key-here  # Primary search provider
+TAVILY_API_KEY=your-tavily-api-key-here  # Fallback search provider
 
 # Optional Configuration
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o-mini
+USE_BRAVE_SEARCH=true  # Default: true (Brave), false (Tavily only)
 ```
 
 ### Example Input
@@ -128,13 +132,14 @@ initial_state = {
 ## Production Features
 
 ### ✅ **Production Features**
-- **Tavily Search Integration**: Real web search with intelligent caching
+- **Dual Search Integration**: Brave Search API (default) with Tavily fallback
+- **Rate Limiting**: 1 request per second for Brave API compliance
+- **Intelligent Caching**: Cost optimization with search result caching
 - **Structured Data Processing**: Pydantic models for consistent parsing
 - **Timeline Construction**: Chronological event sequencing
 - **Error Handling**: Graceful degradation and comprehensive logging
 - **Progress Tracking**: Real-time status monitoring
 - **Environment Configuration**: Flexible API endpoint and model selection
-- **Cost Optimization**: Search result caching and content truncation
 
 ## Key Design Decisions
 

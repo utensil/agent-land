@@ -24,9 +24,8 @@ install:
 test:
     uv run python test_incident_agent.py
 
-# Run incident agent (requires TAVILY_API_KEY + OPENAI_API_KEY)
-run:
-    uv run --env-file .env python incident_agent.py
+incident input:
+    uv run --env-file .env python incident_agent.py {{input}}
 
 # Clean up generated files
 clean:

@@ -15,6 +15,8 @@ import hashlib
 import pickle
 from pathlib import Path
 import logging
+import requests
+import time
 
 # Load environment variables
 load_dotenv()
@@ -27,7 +29,57 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
+# Rate limiting for Brave search (1 request per second)
+last_brave_request_time = 0
+
+def mask_api_key(key: str) -> str:
+    """Mask API key showing only first and last 5 characters"""
+    if not key or len(key) < 10:
+        return "***INVALID***"
+    return f"{key[:5]}...{key[-5:]}"
+
+def extract_json_from_response(response_text: str) -> str:
+    """Extract JSON from markdown code blocks or plain text"""
+    import re
+    
+    # Try to find JSON in markdown code blocks (objects or arrays)
+    json_match = re.search(r'```(?:json)?\s*([{\[].*?[}\]])\s*```', response_text, re.DOTALL)
+    if json_match:
+        return json_match.group(1)
+    
+    # Try to find JSON array directly
+    json_match = re.search(r'\[.*?\]', response_text, re.DOTALL)
+    if json_match:
+        return json_match.group(0)
+    
+    # Try to find JSON object directly
+    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+    if json_match:
+        return json_match.group(0)
+    
+    # Return original if no JSON found
+    return response_text
+
+def log_api_keys():
+    """Log masked API keys for debugging"""
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    brave_key = os.getenv("BRAVE_API_KEY", "")
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    
+    logger.info(f"API Keys - OpenAI: {mask_api_key(openai_key)}")
+    logger.info(f"API Keys - Brave: {mask_api_key(brave_key)}")
+    logger.info(f"API Keys - Tavily: {mask_api_key(tavily_key)}")
+    logger.info(f"Search Config - USE_BRAVE_SEARCH: {os.getenv('USE_BRAVE_SEARCH', 'true')}")
+
+# Log API keys on startup
+log_api_keys()
+
 # Pydantic Models for Structured Output
+class InputParsing(BaseModel):
+    date: str = Field(description="Extracted date or time period")
+    company: Optional[str] = Field(description="Company or service name")
+    incident_description: Optional[str] = Field(description="Brief incident description")
+
 class IncidentMetadata(BaseModel):
     start_time: Optional[str] = Field(description="Incident start time")
     end_time: Optional[str] = Field(description="Incident end time")
@@ -59,28 +111,55 @@ class ProgressStatus(BaseModel):
 
 # State Schema
 class IncidentState(TypedDict):
+    # Input (can be natural language or structured)
+    natural_input: NotRequired[str]
     date: str
     company: NotRequired[str]
     incident_description: NotRequired[str]
+    
+    # Search & Processing
     search_keywords: Annotated[List[str], operator.add]
     search_results: Annotated[List[dict], operator.add]
     metadata: NotRequired[IncidentMetadata]
     timeline: Annotated[List[TimelineEvent], operator.add]
+    
+    # Output & Quality
     incident_report: NotRequired[str]
     missing_info: Annotated[List[str], operator.add]
     review_result: NotRequired[dict]
+    
+    # Control & Monitoring
     iteration_count: int
     progress: NotRequired[ProgressStatus]
     errors: Annotated[List[str], operator.add]
 
 # Initialize clients
 try:
+    openai_key = os.getenv("OPENAI_API_KEY")
+    openai_base_url = os.getenv("OPENAI_BASE_URL")
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    
+    logger.info(f"OpenAI config - Model: {openai_model}, Base URL: {openai_base_url}")
+    logger.info(f"OpenAI API key: {mask_api_key(openai_key)}")
+    
     llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), 
+        model=openai_model, 
         temperature=0,
-        base_url=os.getenv("OPENAI_BASE_URL")
+        base_url=openai_base_url
     )
-    tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+    
+    # Initialize search clients based on configuration
+    use_brave = os.getenv("USE_BRAVE_SEARCH", "true").lower() == "true"
+    
+    if use_brave and os.getenv("BRAVE_API_KEY"):
+        brave_api_key = os.getenv("BRAVE_API_KEY")
+        logger.info("Using Brave Search API")
+    elif os.getenv("TAVILY_API_KEY"):
+        tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+        logger.info("Using Tavily Search API")
+    else:
+        logger.warning("No search API keys found")
+        
 except Exception as e:
     logger.error(f"Failed to initialize clients: {e}")
     raise
@@ -107,17 +186,85 @@ def cache_result(query: str, result: dict):
     except Exception as e:
         logger.warning(f"Cache write error: {e}")
 
-# Enhanced Tools with Error Handling
-@tool
-def tavily_search_with_fallback(query: str) -> dict:
-    """Search using Tavily with caching and error handling"""
+def brave_search_with_rate_limit(query: str) -> dict:
+    """Search using Brave API with rate limiting (1 req/sec)"""
+    global last_brave_request_time
+    
+    logger.info(f"Brave search starting for: {query}")
+    
+    # Rate limiting: ensure 1 second between requests
+    current_time = time.time()
+    time_since_last = current_time - last_brave_request_time
+    if time_since_last < 1.0:
+        sleep_time = 1.0 - time_since_last
+        logger.info(f"Rate limiting: sleeping {sleep_time:.2f}s")
+        time.sleep(sleep_time)
+    
     try:
-        # Check cache first
-        cached = get_cached_result(query)
-        if cached:
-            return {"query": query, "results": cached["results"], "cached": True}
+        api_key = os.getenv("BRAVE_API_KEY")
+        logger.info(f"Using Brave API key: {mask_api_key(api_key)}")
         
-        # Perform search
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": api_key
+        }
+        
+        params = {
+            "q": query,
+            "count": 3,
+            "search_lang": "en",
+            "country": "US",
+            "safesearch": "moderate"
+        }
+        
+        logger.info(f"Brave API request: {params}")
+        
+        response = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers=headers,
+            params=params,
+            timeout=10
+        )
+        
+        last_brave_request_time = time.time()
+        
+        logger.info(f"Brave API response: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            results = []
+            
+            for item in data.get("web", {}).get("results", [])[:3]:
+                results.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "content": item.get("description", "")[:500]
+                })
+            
+            logger.info(f"Brave search success: {len(results)} results")
+            return {
+                "query": query,
+                "results": results,
+                "cached": False,
+                "provider": "brave"
+            }
+        else:
+            error_text = response.text[:200] if response.text else "No error details"
+            logger.error(f"Brave API error {response.status_code}: {error_text}")
+            return {"query": query, "results": [], "error": f"API error {response.status_code}: {error_text}", "provider": "brave"}
+            
+    except Exception as e:
+        logger.error(f"Brave search exception: {e}")
+        return {"query": query, "results": [], "error": str(e), "provider": "brave"}
+
+def tavily_search_fallback(query: str) -> dict:
+    """Fallback to Tavily search"""
+    try:
+        logger.info(f"Tavily search starting for: {query}")
+        api_key = os.getenv("TAVILY_API_KEY")
+        logger.info(f"Using Tavily API key: {mask_api_key(api_key)}")
+        
         response = tavily.search(
             query=query,
             search_depth="advanced",
@@ -135,11 +282,85 @@ def tavily_search_with_fallback(query: str) -> dict:
                 }
                 for r in response.get("results", [])
             ],
-            "cached": False
+            "cached": False,
+            "provider": "tavily"
         }
         
-        cache_result(query, result)
+        logger.info(f"Tavily search success: {len(result['results'])} results")
         return result
+        
+    except Exception as e:
+        logger.error(f"Tavily search exception: {e}")
+        return {"query": query, "results": [], "error": str(e), "provider": "tavily"}
+
+# Enhanced Tools with Error Handling
+@tool
+def parse_natural_input(input_text: str) -> InputParsing:
+    """Parse natural language input to extract date, company, and incident description"""
+    try:
+        logger.info(f"Parsing input: {input_text}")
+        
+        prompt = ChatPromptTemplate.from_template("""
+        Extract structured information from this natural language input:
+        "{input_text}"
+        
+        Return ONLY a JSON object with these fields:
+        - date: Any date, time period, or relative time mentioned
+        - company: Company, service, or platform name (null if not found)
+        - incident_description: Brief description of what happened (null if not found)
+        
+        Example: {{"date": "2025-10-29", "company": "Azure", "incident_description": "outage"}}
+        """)
+        
+        response = llm.invoke(prompt.format(input_text=input_text))
+        json_text = extract_json_from_response(response.content)
+        
+        try:
+            parsed_data = json.loads(json_text)
+            result = InputParsing(**parsed_data)
+            logger.info(f"Parsing result: date={result.date}, company={result.company}, description={result.incident_description}")
+            return result
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"JSON parsing failed: {e}, raw response: {response.content[:200]}")
+            raise e
+        
+    except Exception as e:
+        logger.error(f"Input parsing failed: {e}")
+        return InputParsing(
+            date=input_text,  # Fallback to original input
+            company=None,
+            incident_description=None
+        )
+
+@tool
+def search_with_fallback(query: str) -> dict:
+    """Search using Brave (default) or Tavily with caching and error handling"""
+    try:
+        # Check cache first
+        cached = get_cached_result(query)
+        if cached:
+            return {"query": query, "results": cached["results"], "cached": True, "provider": cached.get("provider", "cache")}
+        
+        # Try Brave search first (if enabled and API key available)
+        use_brave = os.getenv("USE_BRAVE_SEARCH", "true").lower() == "true"
+        
+        if use_brave and os.getenv("BRAVE_API_KEY"):
+            result = brave_search_with_rate_limit(query)
+            if result.get("results"):  # Success
+                cache_result(query, result)
+                return result
+            else:
+                logger.warning("Brave search failed, trying Tavily fallback")
+        
+        # Fallback to Tavily
+        if os.getenv("TAVILY_API_KEY"):
+            result = tavily_search_fallback(query)
+            if result.get("results"):
+                cache_result(query, result)
+                return result
+        
+        # No results from either provider
+        return {"query": query, "results": [], "error": "No search providers available", "cached": False}
         
     except Exception as e:
         logger.error(f"Search failed for '{query}': {e}")
@@ -149,17 +370,30 @@ def tavily_search_with_fallback(query: str) -> dict:
 def extract_incident_metadata(content: str) -> IncidentMetadata:
     """Extract structured incident metadata from content"""
     try:
-        llm_with_structure = llm.with_structured_output(IncidentMetadata)
         prompt = ChatPromptTemplate.from_template("""
         Extract incident metadata from this content:
         {content}
         
-        Focus on: start/end times, affected services, severity, status.
-        If information is missing, leave fields empty.
+        Return ONLY a JSON object with these fields:
+        - start_time: Incident start time (null if not found)
+        - end_time: Incident end time (null if not found)  
+        - affected_services: Array of affected services (empty array if none)
+        - severity: Incident severity level (null if not found)
+        - status: Current incident status (null if not found)
+        
+        Example: {{"start_time": null, "end_time": null, "affected_services": ["Azure"], "severity": "high", "status": "resolved"}}
         """)
         
-        result = llm_with_structure.invoke(prompt.format(content=content))
-        return result
+        response = llm.invoke(prompt.format(content=content))
+        json_text = extract_json_from_response(response.content)
+        
+        try:
+            parsed_data = json.loads(json_text)
+            result = IncidentMetadata(**parsed_data)
+            return result
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Metadata JSON parsing failed: {e}, raw response: {response.content[:200]}")
+            raise e
         
     except Exception as e:
         logger.error(f"Metadata extraction failed: {e}")
@@ -172,19 +406,52 @@ def extract_incident_metadata(content: str) -> IncidentMetadata:
 def build_timeline(search_results: List[dict]) -> List[TimelineEvent]:
     """Build chronological timeline from search results"""
     try:
-        llm_with_structure = llm.with_structured_output(List[TimelineEvent])
         content = json.dumps(search_results, indent=2)
         
         prompt = ChatPromptTemplate.from_template("""
         Build a chronological timeline from these search results:
         {content}
         
-        Extract key events with timestamps. Sort chronologically.
-        Include source for each event.
+        Return ONLY a JSON array of timeline events. Each event should have:
+        - timestamp: Event timestamp
+        - event: Event description  
+        - source: Information source
+        
+        Example: [{{"timestamp": "2025-10-29 10:00", "event": "Outage detected", "source": "Azure Status"}}]
         """)
         
-        timeline = llm_with_structure.invoke(prompt.format(content=content))
-        return timeline or []
+        response = llm.invoke(prompt.format(content=content))
+        json_text = extract_json_from_response(response.content)
+        
+        try:
+            # Handle incomplete JSON by trying to fix common issues
+            if not json_text.strip().endswith(']') and json_text.strip().startswith('['):
+                # Try to close incomplete array
+                brace_count = 0
+                quote_count = 0
+                in_string = False
+                last_complete = -1
+                
+                for i, char in enumerate(json_text):
+                    if char == '"' and (i == 0 or json_text[i-1] != '\\'):
+                        in_string = not in_string
+                    elif not in_string:
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                last_complete = i
+                
+                if last_complete > 0 and not json_text.strip().endswith(']'):
+                    json_text = json_text[:last_complete + 1] + ']'
+            
+            parsed_data = json.loads(json_text)
+            timeline = [TimelineEvent(**event) for event in parsed_data] if isinstance(parsed_data, list) else []
+            return timeline
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Timeline JSON parsing failed: {e}, raw response: {response.content[:200]}")
+            return []
         
     except Exception as e:
         logger.error(f"Timeline construction failed: {e}")
@@ -194,8 +461,6 @@ def build_timeline(search_results: List[dict]) -> List[TimelineEvent]:
 def generate_structured_report(search_data: str, metadata: dict, timeline: List[dict]) -> IncidentReport:
     """Generate structured incident report"""
     try:
-        llm_with_structure = llm.with_structured_output(IncidentReport)
-        
         prompt = ChatPromptTemplate.from_template("""
         Create a comprehensive incident report using:
         
@@ -203,17 +468,36 @@ def generate_structured_report(search_data: str, metadata: dict, timeline: List[
         Metadata: {metadata}
         Timeline: {timeline}
         
-        Generate complete sections for summary, root cause, impact, and resolution.
-        List any missing information needed for completeness.
+        Return ONLY a JSON object with these fields:
+        - summary: Incident summary
+        - timeline: Array of timeline events (can reuse provided timeline)
+        - root_cause: Root cause analysis
+        - impact: Impact assessment
+        - resolution: Resolution steps
+        - missing_info: Array of missing information
+        
+        Example: {{"summary": "Azure outage", "timeline": [], "root_cause": "Network issue", "impact": "Service disruption", "resolution": "Fixed routing", "missing_info": ["Duration"]}}
         """)
         
-        report = llm_with_structure.invoke(prompt.format(
+        response = llm.invoke(prompt.format(
             search_data=search_data,
             metadata=json.dumps(metadata),
             timeline=json.dumps(timeline)
         ))
         
-        return report
+        json_text = extract_json_from_response(response.content)
+        
+        try:
+            parsed_data = json.loads(json_text)
+            # Convert timeline data if present
+            if 'timeline' in parsed_data and isinstance(parsed_data['timeline'], list):
+                parsed_data['timeline'] = [TimelineEvent(**event) if isinstance(event, dict) else event for event in parsed_data['timeline']]
+            
+            report = IncidentReport(**parsed_data)
+            return report
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Report JSON parsing failed: {e}, raw response: {response.content[:200]}")
+            raise e
         
     except Exception as e:
         logger.error(f"Report generation failed: {e}")
@@ -270,6 +554,32 @@ def update_progress(state: IncidentState, step: str, **updates) -> dict:
     return {"progress": current_progress}
 
 # Enhanced Node Functions
+def parse_node(state: IncidentState) -> dict:
+    """Parse natural language input into structured fields"""
+    try:
+        natural_input = state.get("natural_input")
+        if natural_input:
+            parsed = parse_natural_input.invoke({"input_text": natural_input})
+            
+            progress_update = update_progress(state, "input_parsed")
+            
+            return {
+                "date": parsed.date,
+                "company": parsed.company,
+                "incident_description": parsed.incident_description,
+                **progress_update
+            }
+        else:
+            # Already structured input, just update progress
+            return update_progress(state, "input_ready")
+            
+    except Exception as e:
+        logger.error(f"Parse node failed: {e}")
+        return {
+            "errors": [f"Parsing error: {str(e)}"],
+            **update_progress(state, "parsing_failed")
+        }
+
 def search_node(state: IncidentState) -> dict:
     """Enhanced search with progress tracking and error handling"""
     try:
@@ -291,12 +601,17 @@ def search_node(state: IncidentState) -> dict:
         errors = []
         
         for query in queries:
-            result = tavily_search_with_fallback.invoke({"query": query})
+            result = search_with_fallback.invoke({"query": query})
             results.append(result)
             keywords.extend(query.split())
             
             if "error" in result:
                 errors.append(f"Search error: {result['error']}")
+            
+            # Log search provider used
+            provider = result.get("provider", "unknown")
+            cached = result.get("cached", False)
+            logger.info(f"Search: {query[:50]}... | Provider: {provider} | Cached: {cached}")
         
         progress_update = update_progress(state, "search_complete", search_complete=True)
         
@@ -353,10 +668,22 @@ def generate_node(state: IncidentState) -> dict:
         metadata = state.get("metadata", {})
         timeline = state.get("timeline", [])
         
+        # Convert IncidentMetadata to dict if needed
+        if hasattr(metadata, '__dict__'):
+            metadata = metadata.__dict__
+        
+        # Convert TimelineEvent objects to dicts
+        timeline_dicts = []
+        for event in timeline:
+            if hasattr(event, '__dict__'):
+                timeline_dicts.append(event.__dict__)
+            else:
+                timeline_dicts.append(event)
+        
         report = generate_structured_report.invoke({
             "search_data": search_content,
             "metadata": metadata,
-            "timeline": timeline
+            "timeline": timeline_dicts
         })
         
         progress_update = update_progress(state, "report_generated", report_generated=True)
@@ -400,15 +727,16 @@ def review_node(state: IncidentState) -> dict:
         }
 
 def should_continue(state: IncidentState) -> Literal["search", END]:
-    """Enhanced continuation logic with error handling"""
+    """Enhanced continuation logic with error handling - limited to 1 iteration"""
     # Check for critical errors
     errors = state.get("errors", [])
     if len(errors) > 5:  # Too many errors
         logger.warning("Too many errors, stopping iteration")
         return END
     
-    # Max iterations check
-    if state.get("iteration_count", 0) >= 3:
+    # Max iterations check - reduced to 1 for token saving
+    if state.get("iteration_count", 0) >= 1:
+        logger.info("Reached max iterations (1), stopping to save tokens")
         return END
     
     # Quality check
@@ -422,12 +750,14 @@ def create_incident_agent():
     """Create production-ready incident agent"""
     workflow = StateGraph(IncidentState)
     
+    workflow.add_node("parse", parse_node)
     workflow.add_node("search", search_node)
     workflow.add_node("extract", extract_node)
     workflow.add_node("generate", generate_node)
     workflow.add_node("review", review_node)
     
-    workflow.add_edge(START, "search")
+    workflow.add_edge(START, "parse")
+    workflow.add_edge("parse", "search")
     workflow.add_edge("search", "extract")
     workflow.add_edge("extract", "generate")
     workflow.add_edge("generate", "review")
@@ -436,35 +766,63 @@ def create_incident_agent():
     return workflow.compile()
 
 if __name__ == "__main__":
-    if not os.getenv("TAVILY_API_KEY"):
-        print("Please set TAVILY_API_KEY environment variable")
-        exit(1)
     if not os.getenv("OPENAI_API_KEY"):
         print("Please set OPENAI_API_KEY environment variable")
         exit(1)
     
-    agent = create_incident_agent()
+    # Check for command line argument
+    import sys
+    if len(sys.argv) > 1:
+        natural_input = " ".join(sys.argv[1:])
+        initial_state = {
+            "natural_input": natural_input,
+            "date": "",  # Will be filled by parsing
+            "search_keywords": [],
+            "search_results": [],
+            "timeline": [],
+            "missing_info": [],
+            "iteration_count": 0,
+            "errors": [],
+            "progress": ProgressStatus()
+        }
+        print(f"Analyzing: {natural_input}")
+    else:
+        # Default example
+        initial_state = {
+            "natural_input": "Azure outage on 2025-10-29",
+            "date": "",
+            "search_keywords": [],
+            "search_results": [],
+            "timeline": [],
+            "missing_info": [],
+            "iteration_count": 0,
+            "errors": [],
+            "progress": ProgressStatus()
+        }
+        print("Using default example: Azure outage on 2025-10-29")
     
-    initial_state = {
-        "date": "November 2024",
-        "company": "AWS",
-        "incident_description": "S3 outage",
-        "search_keywords": [],
-        "search_results": [],
-        "timeline": [],
-        "missing_info": [],
-        "iteration_count": 0,
-        "errors": [],
-        "progress": ProgressStatus()
-    }
+    agent = create_incident_agent()
     
     print("Starting incident analysis...")
     result = agent.invoke(initial_state)
+    
+    print(f"\n=== PARSED INPUT ===")
+    print(f"Date: {result.get('date', 'N/A')}")
+    print(f"Company: {result.get('company', 'N/A')}")
+    print(f"Description: {result.get('incident_description', 'N/A')}")
     
     print(f"\n=== FINAL REPORT ===")
     print(result["incident_report"])
     print(f"\nIterations: {result['iteration_count']}")
     print(f"Errors encountered: {len(result.get('errors', []))}")
+    
+    # Show search provider usage
+    search_results = result.get("search_results", [])
+    if search_results:
+        providers = [r.get("provider", "unknown") for r in search_results]
+        cached_count = sum(1 for r in search_results if r.get("cached"))
+        print(f"Search providers used: {set(providers)}")
+        print(f"Cache hits: {cached_count}/{len(search_results)}")
     
     progress = result.get("progress", {})
     print(f"Final progress: {progress}")
