@@ -73,11 +73,9 @@ class IncidentState(TypedDict):
 
 ## Files
 
-- `incident_agent.py`: Basic implementation with mock tools
-- `incident_agent_enhanced.py`: LLM integration version
-- `incident_agent_tavily.py`: Tavily search with caching
-- `incident_agent_production.py`: **Full production version with all features**
+- `incident_agent.py`: **Production-ready implementation with all features**
 - `test_incident_agent.py`: Test suite and examples
+- `.env.example`: Environment configuration template
 
 ## Usage
 
@@ -89,14 +87,8 @@ just install
 # Run tests
 just test
 
-# Run basic agent
+# Run incident agent (requires API keys in .env)
 just run
-
-# Run enhanced version (requires API keys)
-just run-enhanced
-
-# Run production version (full features)
-just run-production
 ```
 
 ### Environment Setup
@@ -135,7 +127,7 @@ initial_state = {
 
 ## Production Features
 
-### ✅ **Implemented**
+### ✅ **Production Features**
 - **Tavily Search Integration**: Real web search with intelligent caching
 - **Structured Data Processing**: Pydantic models for consistent parsing
 - **Timeline Construction**: Chronological event sequencing
@@ -143,12 +135,6 @@ initial_state = {
 - **Progress Tracking**: Real-time status monitoring
 - **Environment Configuration**: Flexible API endpoint and model selection
 - **Cost Optimization**: Search result caching and content truncation
-
-### 🔄 **Available Versions**
-1. **Basic** (`incident_agent.py`): Mock implementation for testing
-2. **Enhanced** (`incident_agent_enhanced.py`): LLM-powered with basic search
-3. **Tavily** (`incident_agent_tavily.py`): Real search with caching
-4. **Production** (`incident_agent_production.py`): Full feature set
 
 ## Key Design Decisions
 
