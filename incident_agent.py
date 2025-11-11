@@ -32,6 +32,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress httpx logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # Cache setup
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -307,94 +310,109 @@ def log_llm_response(response_content: str, context: str = "LLM"):
         logger.info(f"🤖 {context}: Response received (parse error)")
 
 def evaluate_search_results_strict(query: str, results: List[dict]) -> dict:
-    """Comprehensive multi-angle evaluation of incident search results"""
+    """Comprehensive multi-angle evaluation of incident search results in one LLM call"""
     try:
         if not results:
             return {"overall_relevant": False, "average_score": 0, "results_scores": [], "reason": "No results"}
         
-        # Evaluate each result individually with comprehensive criteria
-        results_evaluation = []
-        
+        # Prepare all results for single LLM evaluation
+        results_content = ""
         for i, result in enumerate(results):
             content_sample = f"Title: {result.get('title', '')}\nURL: {result.get('url', '')}\nContent: {result.get('content', '')[:400]}..."
+            results_content += f"\n--- RESULT {i+1} ---\n{content_sample}\n"
+        
+        prompt = ChatPromptTemplate.from_template("""
+        Analyze ALL search results for incident completeness: {query}
+        
+        {results_content}
+        
+        Multi-angle evaluation framework for EACH result:
+        
+        1. INCIDENT PROCESS COMPLETENESS (0-10):
+           - Timeline clarity (start/end times, key milestones)
+           - Impact components (affected services, systems)
+           - Event sequence (what happened when)
+        
+        2. ROOT CAUSE DEPTH (0-10):
+           - Direct cause identification
+           - Root cause analysis depth
+           - Technical detail accuracy
+        
+        3. IMPACT SCOPE DETAIL (0-10):
+           - User impact quantification
+           - Service scope (which services affected)
+           - Geographic/duration specificity
+        
+        4. ACTIONABLE MEASURES (0-10):
+           - Prevention measures (before)
+           - Response measures (during)
+           - Recovery measures (after)
+        
+        5. SOURCE CREDIBILITY (0-10):
+           - Official status pages/postmortems
+           - Technical blogs/documentation
+           - News reliability and technical depth
+        
+        Return JSON array with evaluation for each result:
+        [
+          {{
+            "result_index": 0,
+            "incident_completeness": 0-10,
+            "root_cause_depth": 0-10,
+            "impact_scope": 0-10,
+            "actionable_measures": 0-10,
+            "source_credibility": 0-10,
+            "overall_score": 0-10,
+            "incident_type": "availability/security/news/other",
+            "is_duplicate": true/false,
+            "missing_info": ["list", "of", "missing", "elements"],
+            "reasoning": "brief explanation of scoring"
+          }},
+          ...
+        ]
+        
+        STRICT CRITERIA: Only score 8+ for comprehensive incident reports with clear timeline, root cause, and actionable details.
+        FOCUS: System availability incidents only, exclude security breaches and general news.
+        """)
+        
+        response = llm.invoke(prompt.format(query=query, results_content=results_content))
+        
+        # Extract individual reasoning from the response for logging
+        result_json = extract_json_from_response(response.content)
+        
+        if result_json:
+            import json
+            results_evaluation = json.loads(result_json)
             
-            prompt = ChatPromptTemplate.from_template("""
-            Analyze this search result for incident completeness: {query}
-            
-            Result:
-            {content}
-            
-            Multi-angle evaluation framework:
-            
-            1. INCIDENT PROCESS COMPLETENESS (0-10):
-               - Timeline clarity (start/end times, key milestones)
-               - Impact components (affected services, systems)
-               - Event sequence (what happened when)
-            
-            2. ROOT CAUSE DEPTH (0-10):
-               - Direct cause identification
-               - Root cause analysis depth
-               - Technical detail accuracy
-            
-            3. IMPACT SCOPE DETAIL (0-10):
-               - User impact quantification
-               - Service scope (which services affected)
-               - Geographic/duration specificity
-            
-            4. ACTIONABLE MEASURES (0-10):
-               - Prevention measures (before)
-               - Response measures (during)
-               - Recovery measures (after)
-            
-            5. SOURCE CREDIBILITY (0-10):
-               - Official status pages/postmortems
-               - Technical blogs/documentation
-               - News reliability and technical depth
-            
-            Return JSON with:
-            - "incident_completeness": 0-10 (timeline, components, sequence)
-            - "root_cause_depth": 0-10 (direct + root cause analysis)
-            - "impact_scope": 0-10 (users, services, geography, duration)
-            - "actionable_measures": 0-10 (prevention, response, recovery)
-            - "source_credibility": 0-10 (official sources, technical depth)
-            - "overall_score": 0-10 (weighted average: completeness 25%, cause 25%, impact 20%, measures 15%, credibility 15%)
-            - "incident_type": "availability/security/news/other"
-            - "is_duplicate": true/false (if similar to common incidents)
-            - "missing_info": ["list", "of", "missing", "elements"]
-            - "reasoning": "brief explanation of scoring"
-            
-            STRICT CRITERIA: Only score 8+ for comprehensive incident reports with clear timeline, root cause, and actionable details.
-            FOCUS: System availability incidents only, exclude security breaches and general news.
-            """)
-            
-            try:
-                response = llm.invoke(prompt.format(query=query, content=content_sample))
-                log_llm_response(response.content, f"Eval-{i+1}")
-                result_json = extract_json_from_response(response.content)
+            # Log individual evaluations
+            for i, evaluation in enumerate(results_evaluation):
+                reasoning = evaluation.get("reasoning", "No reasoning provided")
+                score = evaluation.get("overall_score", 0)
+                incident_completeness = evaluation.get("incident_completeness", 0)
+                root_cause_depth = evaluation.get("root_cause_depth", 0)
                 
-                if result_json:
-                    import json
-                    evaluation = json.loads(result_json)
-                    evaluation["result_index"] = i
-                    evaluation["url"] = result.get("url", "")
-                    evaluation["title"] = result.get("title", "")
-                    results_evaluation.append(evaluation)
-                else:
-                    results_evaluation.append({
-                        "result_index": i, "overall_score": 2, "reasoning": "Could not evaluate",
-                        "incident_completeness": 2, "root_cause_depth": 2, "impact_scope": 2,
-                        "actionable_measures": 2, "source_credibility": 2, "incident_type": "other",
-                        "is_duplicate": False, "missing_info": ["evaluation_failed"],
-                        "url": result.get("url", ""), "title": result.get("title", "")
-                    })
-            except Exception as e:
-                logger.error(f"Individual result evaluation failed: {e}")
+                # Calculate relevance and comprehensiveness
+                relevance_score = (score + incident_completeness) / 2
+                comprehensiveness_score = (incident_completeness + root_cause_depth) / 2
+                
+                log_llm_response(f"Result {i+1}: Match:{relevance_score:.1f} Depth:{comprehensiveness_score:.1f} Overall:{score}/10 | {reasoning}", f"Eval-{i+1}")
+            
+            # Add URL and title to each evaluation
+            for i, evaluation in enumerate(results_evaluation):
+                if i < len(results):
+                    evaluation["url"] = results[i].get("url", "")
+                    evaluation["title"] = results[i].get("title", "")
+        else:
+            log_llm_response("Failed to parse evaluation results", "EvalAll")
+            # Fallback to default scores if parsing fails
+            results_evaluation = []
+            for i in range(len(results)):
                 results_evaluation.append({
-                    "result_index": i, "overall_score": 1, "reasoning": "Evaluation error",
-                    "incident_completeness": 1, "root_cause_depth": 1, "impact_scope": 1,
-                    "actionable_measures": 1, "source_credibility": 1, "incident_type": "other",
-                    "is_duplicate": False, "missing_info": ["evaluation_error"],
-                    "url": result.get("url", ""), "title": result.get("title", "")
+                    "result_index": i, "overall_score": 2, "reasoning": "Could not evaluate",
+                    "incident_completeness": 2, "root_cause_depth": 2, "impact_scope": 2,
+                    "actionable_measures": 2, "source_credibility": 2, "incident_type": "other",
+                    "is_duplicate": False, "missing_info": ["evaluation_failed"],
+                    "url": results[i].get("url", ""), "title": results[i].get("title", "")
                 })
         
         # Calculate comprehensive metrics
@@ -504,7 +522,7 @@ def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int
             title = r.get("title", "No title")[:60] + "..." if len(r.get("title", "")) > 60 else r.get("title", "No title")
             logger.info(f"   {j+1}. {title}")
         
-        # Comprehensive multi-angle evaluation
+        # Always evaluate results (even if from cache)
         evaluation = evaluate_search_results_strict(search_query, result["results"])
         avg_score = evaluation.get("average_score", 0)
         max_score = evaluation.get("max_score", 0)
@@ -777,6 +795,7 @@ def parse_natural_input(input_text: str) -> InputParsing:
         """)
         
         response = llm.invoke(prompt.format(input_text=input_text))
+        log_llm_response(response.content, "Parse")
         json_text = extract_json_from_response(response.content)
         
         try:
@@ -803,7 +822,18 @@ def search_with_fallback(query: str) -> dict:
         # Check cache first
         cached = get_cached_result(query)
         if cached:
-            return {"query": query, "results": cached["results"], "cached": True, "provider": cached.get("provider", "cache")}
+            logger.info(f"💾 Using cached search results")
+            cached_result = {"query": query, "results": cached["results"], "cached": True, "provider": cached.get("provider", "cache")}
+            
+            # Evaluate cached results
+            logger.info(f"📋 Found {len(cached['results'])} cached results:")
+            for j, r in enumerate(cached["results"][:3]):  # Show first 3
+                title = r.get("title", "No title")[:60] + "..." if len(r.get("title", "")) > 60 else r.get("title", "No title")
+                logger.info(f"   {j+1}. {title}")
+            
+            evaluation = evaluate_search_results_strict(query, cached["results"])
+            cached_result["evaluation"] = evaluation
+            return cached_result
         
         # Try TC search first with smart keywords
         if os.getenv("TC_SECRET_ID") and os.getenv("TC_SECRET_KEY"):
