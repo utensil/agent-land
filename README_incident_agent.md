@@ -5,7 +5,7 @@ A production-ready LangGraph agent that automatically generates comprehensive in
 ## Features
 
 - **Structured Input Processing**: Accepts date, company, and incident description
-- **Intelligent Web Search**: Brave Search API (default) with Tavily fallback and caching
+- **Intelligent Web Search**: TC Search API (primary) with Brave and Tavily fallback and caching
 - **Structured Data Extraction**: Pydantic models for consistent metadata parsing
 - **Timeline Construction**: Chronological event sequencing from multiple sources
 - **Root Cause Analysis**: Structured incident reports following industry templates
@@ -104,8 +104,10 @@ cp .env.example .env
 ```bash
 # Required API Keys
 OPENAI_API_KEY=your-openai-api-key-here
-BRAVE_API_KEY=your-brave-api-key-here  # Primary search provider
-TAVILY_API_KEY=your-tavily-api-key-here  # Fallback search provider
+TC_SECRET_ID=your-tc-secret-id-here              # Primary search provider
+TC_SECRET_KEY=your-tc-secret-key-here            # Primary search provider
+BRAVE_API_KEY=your-brave-api-key-here            # First fallback search provider
+TAVILY_API_KEY=your-tavily-api-key-here          # Second fallback search provider
 
 # Optional Configuration
 OPENAI_BASE_URL=https://api.openai.com/v1
@@ -132,7 +134,7 @@ initial_state = {
 ## Production Features
 
 ### ✅ **Production Features**
-- **Dual Search Integration**: Brave Search API (default) with Tavily fallback
+- **Triple Search Integration**: TC Search API (primary) with Brave and Tavily fallback
 - **Rate Limiting**: 1 request per second for Brave API compliance
 - **Intelligent Caching**: Cost optimization with search result caching
 - **Structured Data Processing**: Pydantic models for consistent parsing
@@ -167,7 +169,7 @@ just test  # Run basic functionality tests
 ## Production Considerations
 
 ### ✅ **Implemented**
-- Real web search with Tavily API integration
+- Real web search with TC, Brave, and Tavily API integration
 - Intelligent caching for cost optimization
 - Comprehensive error handling and logging
 - Structured data validation with Pydantic

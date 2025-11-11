@@ -18,6 +18,13 @@ import logging
 import requests
 import time
 
+# Tencent Cloud SDK imports
+from tencentcloud.common import credential
+from tencentcloud.common.profile.client_profile import ClientProfile
+from tencentcloud.common.profile.http_profile import HttpProfile
+from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+from tencentcloud.wsa.v20250508 import wsa_client, models
+
 # Load environment variables
 load_dotenv()
 
@@ -65,8 +72,10 @@ def log_api_keys():
     openai_key = os.getenv("OPENAI_API_KEY", "")
     brave_key = os.getenv("BRAVE_API_KEY", "")
     tavily_key = os.getenv("TAVILY_API_KEY", "")
+    tc_id = os.getenv("TC_SECRET_ID", "")
     
     logger.info(f"API Keys - OpenAI: {mask_api_key(openai_key)}")
+    logger.info(f"API Keys - TC: {mask_api_key(tc_id)}")
     logger.info(f"API Keys - Brave: {mask_api_key(brave_key)}")
     logger.info(f"API Keys - Tavily: {mask_api_key(tavily_key)}")
     logger.info(f"Search Config - USE_BRAVE_SEARCH: {os.getenv('USE_BRAVE_SEARCH', 'true')}")
@@ -151,7 +160,9 @@ try:
     # Initialize search clients based on configuration
     use_brave = os.getenv("USE_BRAVE_SEARCH", "true").lower() == "true"
     
-    if use_brave and os.getenv("BRAVE_API_KEY"):
+    if os.getenv("TC_SECRET_ID") and os.getenv("TC_SECRET_KEY"):
+        logger.info("Using TC Search API")
+    elif use_brave and os.getenv("BRAVE_API_KEY"):
         brave_api_key = os.getenv("BRAVE_API_KEY")
         logger.info("Using Brave Search API")
     elif os.getenv("TAVILY_API_KEY"):
@@ -258,6 +269,74 @@ def brave_search_with_rate_limit(query: str) -> dict:
         logger.error(f"Brave search exception: {e}")
         return {"query": query, "results": [], "error": str(e), "provider": "brave"}
 
+def tc_search(query: str) -> dict:
+    """Search using TC Cloud API with official SDK"""
+    try:
+        logger.info(f"TC search starting for: {query}")
+        
+        secret_id = os.getenv("TC_SECRET_ID")
+        secret_key = os.getenv("TC_SECRET_KEY")
+        
+        if not secret_id or not secret_key:
+            logger.warning("TC API credentials not found")
+            return {"query": query, "results": [], "error": "Missing credentials", "provider": "tc"}
+        
+        # Initialize credentials
+        cred = credential.Credential(secret_id, secret_key)
+        
+        # Configure HTTP profile
+        httpProfile = HttpProfile()
+        httpProfile.endpoint = "wsa.tencentcloudapi.com"
+        
+        # Configure client profile
+        clientProfile = ClientProfile()
+        clientProfile.httpProfile = httpProfile
+        
+        # Initialize client
+        client = wsa_client.WsaClient(cred, "", clientProfile)
+        
+        # Create request
+        req = models.SearchProRequest()
+        params = {
+            "Query": f"{query} site:github.com OR site:status.aws.amazon.com OR site:reddit.com",
+            "Mode": 0  # Natural search
+        }
+        req.from_json_string(json.dumps(params))
+        
+        # Execute search
+        resp = client.SearchPro(req)
+        response_data = json.loads(resp.to_json_string())
+        
+        # Parse results
+        results = []
+        pages = response_data.get("Pages")
+        
+        if pages is None:
+            logger.warning("TC search returned no Pages field")
+            return {"query": query, "results": [], "error": "No results", "provider": "tc"}
+        
+        for page_json in pages:
+            try:
+                page = json.loads(page_json)
+                results.append({
+                    "title": page.get("title", ""),
+                    "url": page.get("url", ""),
+                    "content": page.get("passage", ""),
+                    "score": page.get("score", 0)
+                })
+            except json.JSONDecodeError:
+                continue
+        
+        logger.info(f"TC search success: {len(results)} results")
+        return {"query": query, "results": results, "provider": "tc"}
+        
+    except TencentCloudSDKException as e:
+        logger.error(f"TC SDK exception: {e}")
+        return {"query": query, "results": [], "error": str(e), "provider": "tc"}
+    except Exception as e:
+        logger.error(f"TC search exception: {e}")
+        return {"query": query, "results": [], "error": str(e), "provider": "tc"}
+
 def tavily_search_fallback(query: str) -> dict:
     """Fallback to Tavily search"""
     try:
@@ -334,14 +413,23 @@ def parse_natural_input(input_text: str) -> InputParsing:
 
 @tool
 def search_with_fallback(query: str) -> dict:
-    """Search using Brave (default) or Tavily with caching and error handling"""
+    """Search using TC (primary), Brave, or Tavily with caching and error handling"""
     try:
         # Check cache first
         cached = get_cached_result(query)
         if cached:
             return {"query": query, "results": cached["results"], "cached": True, "provider": cached.get("provider", "cache")}
         
-        # Try Brave search first (if enabled and API key available)
+        # Try TC search first
+        if os.getenv("TC_SECRET_ID") and os.getenv("TC_SECRET_KEY"):
+            result = tc_search(query)
+            if result.get("results"):  # Success
+                cache_result(query, result)
+                return result
+            else:
+                logger.warning("TC search failed, trying Brave fallback")
+        
+        # Try Brave search as first fallback (if enabled and API key available)
         use_brave = os.getenv("USE_BRAVE_SEARCH", "true").lower() == "true"
         
         if use_brave and os.getenv("BRAVE_API_KEY"):
@@ -359,7 +447,7 @@ def search_with_fallback(query: str) -> dict:
                 cache_result(query, result)
                 return result
         
-        # No results from either provider
+        # No results from any provider
         return {"query": query, "results": [], "error": "No search providers available", "cached": False}
         
     except Exception as e:

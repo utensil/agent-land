@@ -24,6 +24,10 @@ install:
 test:
     uv run python test_incident_agent.py
 
+# Test TC search integration
+test-tc:
+    uv run python test_tc_search.py
+
 incident input:
     uv run --env-file .env python incident_agent.py {{input}}
 
