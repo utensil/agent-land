@@ -74,11 +74,11 @@ def log_api_keys():
     tavily_key = os.getenv("TAVILY_API_KEY", "")
     tc_id = os.getenv("TC_SECRET_ID", "")
     
-    logger.info(f"API Keys - OpenAI: {mask_api_key(openai_key)}")
-    logger.info(f"API Keys - TC: {mask_api_key(tc_id)}")
-    logger.info(f"API Keys - Brave: {mask_api_key(brave_key)}")
-    logger.info(f"API Keys - Tavily: {mask_api_key(tavily_key)}")
-    logger.info(f"Search Config - USE_BRAVE_SEARCH: {os.getenv('USE_BRAVE_SEARCH', 'true')}")
+    logger.debug(f"API Keys - OpenAI: {mask_api_key(openai_key)}")
+    logger.debug(f"API Keys - TC: {mask_api_key(tc_id)}")
+    logger.debug(f"API Keys - Brave: {mask_api_key(brave_key)}")
+    logger.debug(f"API Keys - Tavily: {mask_api_key(tavily_key)}")
+    logger.debug(f"Search Config - USE_BRAVE_SEARCH: {os.getenv('USE_BRAVE_SEARCH', 'true')}")
 
 # Log API keys on startup
 log_api_keys()
@@ -161,13 +161,13 @@ try:
     use_brave = os.getenv("USE_BRAVE_SEARCH", "true").lower() == "true"
     
     if os.getenv("TC_SECRET_ID") and os.getenv("TC_SECRET_KEY"):
-        logger.info("Using TC Search API")
+        logger.debug("Using TC Search API")
     elif use_brave and os.getenv("BRAVE_API_KEY"):
         brave_api_key = os.getenv("BRAVE_API_KEY")
-        logger.info("Using Brave Search API")
+        logger.debug("Using Brave Search API")
     elif os.getenv("TAVILY_API_KEY"):
         tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-        logger.info("Using Tavily Search API")
+        logger.debug("Using Tavily Search API")
     else:
         logger.warning("No search API keys found")
         
@@ -201,21 +201,21 @@ def brave_search_with_rate_limit(query: str) -> dict:
     """Search using Brave API with rate limiting (1 req/sec)"""
     global last_brave_request_time
     
-    logger.info(f"Brave search starting for: {query}")
+    logger.debug(f"Brave search starting for: {query}")
     
     # Rate limiting: ensure 1 second between requests
     current_time = time.time()
     time_since_last = current_time - last_brave_request_time
     if time_since_last < 1.0:
         sleep_time = 1.0 - time_since_last
-        logger.info(f"Rate limiting: sleeping {sleep_time:.2f}s")
+        logger.debug(f"Rate limiting: sleeping {sleep_time:.2f}s")
         time.sleep(sleep_time)
     
     last_brave_request_time = time.time()
     
     try:
         brave_api_key = os.getenv("BRAVE_API_KEY")
-        logger.info(f"Using Brave API key: {mask_api_key(brave_api_key)}")
+        logger.debug(f"Using Brave API key: {mask_api_key(brave_api_key)}")
         
         headers = {
             "Accept": "application/json",
@@ -231,7 +231,7 @@ def brave_search_with_rate_limit(query: str) -> dict:
             "safesearch": "moderate"
         }
         
-        logger.info(f"Brave API request: {params}")
+        logger.debug(f"Brave API request: {params}")
         
         response = requests.get(
             "https://api.search.brave.com/res/v1/web/search",
@@ -240,7 +240,7 @@ def brave_search_with_rate_limit(query: str) -> dict:
             timeout=10
         )
         
-        logger.info(f"Brave API response: {response.status_code}")
+        logger.debug(f"Brave API response: {response.status_code}")
         response.raise_for_status()
         
         data = response.json()
@@ -254,7 +254,7 @@ def brave_search_with_rate_limit(query: str) -> dict:
                     "content": item.get("description", "")
                 })
             
-            logger.info(f"Brave search success: {len(results)} results")
+            logger.info(f"📊 Brave Search: {len(results)} results found")
             return {
                 "query": query,
                 "results": results,
@@ -367,21 +367,33 @@ def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int
     
     for i, keyword in enumerate(INCIDENT_KEYWORDS[:max_attempts]):
         search_query = f"{date_company} {keyword}"
-        logger.info(f"Trying keyword {i+1}/{max_attempts}: '{keyword}' -> '{search_query}'")
+        logger.info(f"🔍 Trying '{keyword}' keyword ({i+1}/{max_attempts})")
         
         result = provider_func(search_query)
         
         # If search failed or empty, try next keyword
         if result.get("error") or not result.get("results"):
-            logger.info(f"Keyword '{keyword}' failed or empty, trying next")
+            logger.info(f"❌ No results for '{keyword}', trying next")
             continue
+        
+        # Show search results concisely
+        results = result.get("results", [])
+        logger.info(f"📋 Found {len(results)} results:")
+        for j, r in enumerate(results[:3]):  # Show first 3
+            title = r.get("title", "No title")[:60] + "..." if len(r.get("title", "")) > 60 else r.get("title", "No title")
+            logger.info(f"   {j+1}. {title}")
         
         # Strict multi-angle evaluation
         evaluation = evaluate_search_results_strict(search_query, result["results"])
-        logger.info(f"Evaluation: {evaluation['reason']} | Relevant: {evaluation['overall_relevant']}")
+        avg_score = evaluation.get("average_score", 0)
+        max_score = evaluation.get("max_score", 0)
+        relevant_count = evaluation.get("relevant_count", 0)
+        total_count = evaluation.get("total_results", 0)
+        
+        logger.info(f"⭐ Rating: Avg={avg_score:.1f}, Max={max_score}, Relevant={relevant_count}/{total_count}")
         
         # Track best result even if not good enough
-        if evaluation.get("average_score", 0) > best_evaluation.get("average_score", 0):
+        if avg_score > best_evaluation.get("average_score", 0):
             best_result = result
             best_result["keyword_used"] = keyword
             best_result["evaluation"] = evaluation
@@ -389,19 +401,19 @@ def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int
         
         # If good enough, use these results
         if evaluation.get("overall_relevant", False):
-            logger.info(f"Excellent results found with keyword '{keyword}' (avg: {evaluation.get('average_score')})")
+            logger.info(f"✅ Excellent results with '{keyword}' - using these!")
             result["keyword_used"] = keyword
             result["evaluation"] = evaluation
             return result
         
-        logger.info(f"Results not relevant enough, trying next keyword")
+        logger.info(f"⚠️  Not relevant enough, trying next keyword")
     
     # All keywords exhausted - return best result with evaluation details
     if best_result:
-        logger.warning(f"Keywords exhausted. Best result: avg={best_evaluation.get('average_score')}, threshold={RELEVANCE_THRESHOLD}")
+        logger.warning(f"🔄 Keywords exhausted. Best: avg={best_evaluation.get('average_score'):.1f} (threshold={RELEVANCE_THRESHOLD})")
         return best_result
     else:
-        logger.warning("All keywords exhausted, no results found")
+        logger.warning("❌ All keywords exhausted, no results found")
         return {"query": query_base, "results": [], "error": "Keywords exhausted", "provider": "unknown"}
     """Search using Brave API with rate limiting (1 req/sec)"""
     global last_brave_request_time
@@ -477,13 +489,13 @@ def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int
 def tc_search(query: str) -> dict:
     """Search using TC Cloud API with official SDK"""
     try:
-        logger.info(f"TC search starting for: {query}")
+        logger.debug(f"TC search starting for: {query}")
         
         secret_id = os.getenv("TC_SECRET_ID")
         secret_key = os.getenv("TC_SECRET_KEY")
         
         if not secret_id or not secret_key:
-            logger.warning("TC API credentials not found")
+            logger.debug("TC API credentials not found")
             return {"query": query, "results": [], "error": "Missing credentials", "provider": "tc"}
         
         # Initialize credentials
@@ -517,7 +529,7 @@ def tc_search(query: str) -> dict:
         pages = response_data.get("Pages")
         
         if pages is None:
-            logger.warning("TC search returned no Pages field")
+            logger.debug("TC search returned no Pages field")
             return {"query": query, "results": [], "error": "No results", "provider": "tc"}
         
         for page_json in pages:
@@ -532,7 +544,7 @@ def tc_search(query: str) -> dict:
             except json.JSONDecodeError:
                 continue
         
-        logger.info(f"TC search success: {len(results)} results")
+        logger.info(f"📊 TC Search: {len(results)} results found")
         return {"query": query, "results": results, "provider": "tc"}
         
     except TencentCloudSDKException as e:
@@ -627,62 +639,65 @@ def search_with_fallback(query: str) -> dict:
         
         # Try TC search first with smart keywords
         if os.getenv("TC_SECRET_ID") and os.getenv("TC_SECRET_KEY"):
-            logger.info("Trying TC search with keyword strategy")
+            logger.info("🔍 Trying TC Search...")
             result = smart_search_with_keywords(query, tc_search, max_attempts=4)
             
             if result.get("results") and not result.get("error"):
                 evaluation = result.get("evaluation", {})
+                avg_score = evaluation.get("average_score", 0)
                 if evaluation.get("overall_relevant", False):
-                    logger.info(f"TC search: Excellent results found (avg: {evaluation.get('average_score')})")
+                    logger.info(f"✅ TC Search: Excellent results (avg: {avg_score:.1f})")
                     cache_result(query, result)
                     return result
-                elif evaluation.get("average_score", 0) >= RELEVANCE_THRESHOLD:
-                    logger.info(f"TC search: Good results found (avg: {evaluation.get('average_score')})")
+                elif avg_score >= RELEVANCE_THRESHOLD:
+                    logger.info(f"✅ TC Search: Good results (avg: {avg_score:.1f})")
                     cache_result(query, result)
                     return result
                 else:
-                    logger.warning(f"TC search: Results below threshold (avg: {evaluation.get('average_score'):.1f} < {RELEVANCE_THRESHOLD}), trying next provider")
+                    logger.info(f"⚠️  TC Search: Below threshold (avg: {avg_score:.1f} < {RELEVANCE_THRESHOLD})")
             elif result.get("error") == "Keywords exhausted":
-                logger.warning("TC search: All keywords exhausted, trying next provider")
+                logger.info("⚠️  TC Search: All keywords exhausted")
             else:
-                logger.warning("TC search failed, trying Brave fallback")
+                logger.info("❌ TC Search: Failed")
         
         # Try Brave search as first fallback
         use_brave = os.getenv("USE_BRAVE_SEARCH", "true").lower() == "true"
         
         if use_brave and os.getenv("BRAVE_API_KEY"):
-            logger.info("Trying Brave search with keyword strategy")
+            logger.info("🔍 Trying Brave Search...")
             result = smart_search_with_keywords(query, brave_search_with_rate_limit, max_attempts=4)
             
             if result.get("results") and not result.get("error"):
                 evaluation = result.get("evaluation", {})
+                avg_score = evaluation.get("average_score", 0)
                 if evaluation.get("overall_relevant", False):
-                    logger.info(f"Brave search: Excellent results found (avg: {evaluation.get('average_score')})")
+                    logger.info(f"✅ Brave Search: Excellent results (avg: {avg_score:.1f})")
                     cache_result(query, result)
                     return result
-                elif evaluation.get("average_score", 0) >= RELEVANCE_THRESHOLD:
-                    logger.info(f"Brave search: Good results found (avg: {evaluation.get('average_score')})")
+                elif avg_score >= RELEVANCE_THRESHOLD:
+                    logger.info(f"✅ Brave Search: Good results (avg: {avg_score:.1f})")
                     cache_result(query, result)
                     return result
                 else:
-                    logger.warning(f"Brave search: Results below threshold (avg: {evaluation.get('average_score'):.1f} < {RELEVANCE_THRESHOLD}), trying next provider")
+                    logger.info(f"⚠️  Brave Search: Below threshold (avg: {avg_score:.1f} < {RELEVANCE_THRESHOLD})")
             elif result.get("error") == "Keywords exhausted":
-                logger.warning("Brave search: All keywords exhausted, trying next provider")
+                logger.info("⚠️  Brave Search: All keywords exhausted")
             else:
-                logger.warning("Brave search failed, trying Tavily fallback")
+                logger.info("❌ Brave Search: Failed")
         
         # Fallback to Tavily
         if os.getenv("TAVILY_API_KEY"):
-            logger.info("Trying Tavily search with keyword strategy")
+            logger.info("🔍 Trying Tavily Search (final attempt)...")
             result = smart_search_with_keywords(query, tavily_search_fallback, max_attempts=4)
             
             if result.get("results") and not result.get("error"):
                 evaluation = result.get("evaluation", {})
-                logger.info(f"Tavily search: Final attempt (avg: {evaluation.get('average_score', 0):.1f})")
+                avg_score = evaluation.get("average_score", 0)
+                logger.info(f"📊 Tavily Search: Final results (avg: {avg_score:.1f})")
                 cache_result(query, result)
                 return result
             elif result.get("error") == "Keywords exhausted":
-                logger.warning("Tavily search: All keywords exhausted")
+                logger.info("⚠️  Tavily Search: All keywords exhausted")
         
         # No relevant results from any provider
         return {"query": query, "results": [], "error": "No relevant results from any provider", "cached": False}
@@ -915,7 +930,7 @@ def search_node(state: IncidentState) -> dict:
         if state.get("incident_description"):
             base_query += f" {state['incident_description']}"
         
-        logger.info(f"Starting smart search with base query: {base_query}")
+        logger.info(f"🎯 Starting incident search: {base_query}")
         
         # Single smart search with keyword strategy
         result = search_with_fallback.invoke({"query": base_query})
@@ -927,14 +942,19 @@ def search_node(state: IncidentState) -> dict:
         if "error" in result:
             errors.append(f"Search error: {result['error']}")
         
-        # Log search details
+        # Log final search summary
         provider = result.get("provider", "unknown")
         cached = result.get("cached", False)
         keyword_used = result.get("keyword_used", "none")
         evaluation = result.get("evaluation", {})
         
-        logger.info(f"Search complete: Provider: {provider} | Cached: {cached} | Keyword: {keyword_used}")
-        logger.info(f"Evaluation: {evaluation.get('reason', 'N/A')} | Relevant: {evaluation.get('overall_relevant', False)}")
+        if cached:
+            logger.info(f"💾 Used cached results from {provider}")
+        else:
+            avg_score = evaluation.get("average_score", 0)
+            relevant_count = evaluation.get("relevant_count", 0)
+            total_count = evaluation.get("total_results", 0)
+            logger.info(f"📊 Final Results: {provider} | '{keyword_used}' | Score: {avg_score:.1f} | Relevant: {relevant_count}/{total_count}")
         
         progress_update = update_progress(state, "search_complete", search_complete=True)
         
