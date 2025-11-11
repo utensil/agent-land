@@ -105,12 +105,14 @@ class TimelineEvent(BaseModel):
     source: str = Field(description="Information source")
 
 class IncidentReport(BaseModel):
-    summary: str = Field(description="Incident summary")
-    timeline: List[TimelineEvent] = Field(description="Chronological timeline")
-    root_cause: str = Field(description="Root cause analysis")
-    impact: str = Field(description="Impact assessment")
-    resolution: str = Field(description="Resolution steps")
-    missing_info: List[str] = Field(description="Missing information")
+    incident_name: str = Field(description="Incident name in format: {company} on YYYY-MM-DD due to [cause] affecting [services]")
+    company_product: str = Field(description="Company and product information")
+    incident_time: str = Field(description="Incident start time in YYYY-MM-DD HH:MM:SS format")
+    report_links: List[str] = Field(description="Original report links")
+    impact_description: str = Field(description="Geographic, user, service scope and duration impact in markdown")
+    incident_process: str = Field(description="Timeline with trigger, spread, and recovery phases in markdown")
+    root_cause: str = Field(description="Direct and root causes in markdown")
+    improvement_measures: str = Field(description="Prevention and response measures in markdown")
 
 class ProgressStatus(BaseModel):
     search_complete: bool = False
@@ -1007,14 +1009,16 @@ def generate_structured_report(search_data: str, metadata: dict, timeline: List[
         Timeline: {timeline}
         
         Return ONLY a JSON object with these fields:
-        - summary: Incident summary
-        - timeline: Array of timeline events (can reuse provided timeline)
-        - root_cause: Root cause analysis
-        - impact: Impact assessment
-        - resolution: Resolution steps
-        - missing_info: Array of missing information
+        - "incident_name": Format as "{{company}} on YYYY-MM-DD due to [cause] affecting [services]"
+        - "company_product": Simple string with company and product name (e.g., "CrowdStrike Falcon Sensor")
+        - "incident_time": Start time in YYYY-MM-DD HH:MM:SS format (use available data or estimate)
+        - "report_links": Array of original report URLs from search results
+        - "impact_description": Geographic regions, user count, service scope, duration in markdown format
+        - "incident_process": Timeline with three phases in markdown format
+        - "root_cause": Direct and root causes in markdown format  
+        - "improvement_measures": Prevention and response measures in markdown format
         
-        Example: {{"summary": "Azure outage", "timeline": [], "root_cause": "Network issue", "impact": "Service disruption", "resolution": "Fixed routing", "missing_info": ["Duration"]}}
+        Use markdown formatting for multi-line fields. Extract URLs from search data for report_links.
         """)
         
         response = llm.invoke(prompt.format(
@@ -1022,30 +1026,39 @@ def generate_structured_report(search_data: str, metadata: dict, timeline: List[
             metadata=json.dumps(metadata),
             timeline=json.dumps(timeline)
         ))
+        log_llm_response(response.content, "Report")
         
         json_text = extract_json_from_response(response.content)
         
         try:
             parsed_data = json.loads(json_text)
-            # Convert timeline data if present
-            if 'timeline' in parsed_data and isinstance(parsed_data['timeline'], list):
-                parsed_data['timeline'] = [TimelineEvent(**event) if isinstance(event, dict) else event for event in parsed_data['timeline']]
-            
-            report = IncidentReport(**parsed_data)
-            return report
+            result = IncidentReport(**parsed_data)
+            logger.info(f"Generated structured report: {result.incident_name}")
+            return result
         except (json.JSONDecodeError, ValueError) as e:
             logger.error(f"Report JSON parsing failed: {e}, raw response: {response.content[:200]}")
-            raise e
+            return IncidentReport(
+                incident_name="Unknown incident",
+                company_product="Unknown",
+                incident_time="Unknown",
+                report_links=[],
+                impact_description="Unable to determine impact details",
+                incident_process="Unable to determine incident process",
+                root_cause="Unable to determine root cause",
+                improvement_measures="Unable to determine improvement measures"
+            )
         
     except Exception as e:
         logger.error(f"Report generation failed: {e}")
         return IncidentReport(
-            summary="Report generation failed",
-            timeline=[],
-            root_cause="Unable to determine",
-            impact="Unknown",
-            resolution="Unable to determine",
-            missing_info=["All information due to generation error"]
+            incident_name="Report generation failed",
+            company_product="Unknown",
+            incident_time="Unknown", 
+            report_links=[],
+            impact_description="Error occurred during report generation",
+            incident_process="Error occurred during report generation",
+            root_cause="Error occurred during report generation",
+            improvement_measures="Error occurred during report generation"
         )
 
 @tool
@@ -1248,8 +1261,7 @@ def generate_node(state: IncidentState) -> dict:
         progress_update = update_progress(state, "report_generated", report_generated=True)
         
         return {
-            "incident_report": report.summary + "\n\n" + report.root_cause + "\n\n" + report.resolution,
-            "missing_info": report.missing_info,
+            "incident_report": f"# {report.incident_name}\n\n**Company/Product:** {report.company_product}\n\n**Incident Time:** {report.incident_time}\n\n## Impact\n{report.impact_description}\n\n## Incident Process\n{report.incident_process}\n\n## Root Cause\n{report.root_cause}\n\n## Improvement Measures\n{report.improvement_measures}",
             **progress_update
         }
         
