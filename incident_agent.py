@@ -268,106 +268,227 @@ def brave_search_with_rate_limit(query: str) -> dict:
         logger.error(f"Brave search exception: {e}")
         return {"query": query, "results": [], "error": str(e), "provider": "brave"}
 
-# Search keyword pools by priority (most specific to general)
+# Search keyword pools by priority (incident-focused order)
 INCIDENT_KEYWORDS = [
-    "outage", "down", "incident", "disruption", "failure", 
+    "incident", "outage", "down", "disruption", "failure", 
     "unavailable", "postmortem", "service degradation", "issue",
     "maintenance", "problem", "error"
 ]
 
-RELEVANCE_THRESHOLD = 7.0  # Minimum average relevance score to accept results
+RELEVANCE_THRESHOLD = 4.0  # More reasonable threshold for incident relevance
+
+def log_llm_response(response_content: str, context: str = "LLM"):
+    """Log a one-line summary of LLM response"""
+    try:
+        # Try to extract JSON content first
+        import re
+        json_match = re.search(r'"reasoning":\s*"([^"]+)"', response_content)
+        if json_match:
+            reasoning = json_match.group(1)
+            logger.info(f"🤖 {context}: {reasoning}")
+            return
+        
+        # Try to extract overall_score
+        score_match = re.search(r'"overall_score":\s*(\d+(?:\.\d+)?)', response_content)
+        if score_match:
+            score = score_match.group(1)
+            logger.info(f"🤖 {context}: Score {score}/10")
+            return
+        
+        # Fallback to first meaningful line (no truncation)
+        lines = [line.strip() for line in response_content.strip().split('\n') if line.strip()]
+        for line in lines:
+            if not line.startswith('```') and len(line) > 10:
+                logger.info(f"🤖 {context}: {line}")
+                return
+        
+        logger.info(f"🤖 {context}: Response received")
+    except Exception as e:
+        logger.info(f"🤖 {context}: Response received (parse error)")
 
 def evaluate_search_results_strict(query: str, results: List[dict]) -> dict:
-    """Strict multi-angle evaluation of each search result"""
+    """Comprehensive multi-angle evaluation of incident search results"""
     try:
         if not results:
             return {"overall_relevant": False, "average_score": 0, "results_scores": [], "reason": "No results"}
         
-        # Evaluate each result individually
+        # Evaluate each result individually with comprehensive criteria
         results_evaluation = []
         
         for i, result in enumerate(results):
-            content_sample = f"Title: {result.get('title', '')}\nURL: {result.get('url', '')}\nContent: {result.get('content', '')[:300]}..."
+            content_sample = f"Title: {result.get('title', '')}\nURL: {result.get('url', '')}\nContent: {result.get('content', '')[:400]}..."
             
             prompt = ChatPromptTemplate.from_template("""
-            Evaluate this search result for relevance to: {query}
+            Analyze this search result for incident completeness: {query}
             
             Result:
             {content}
             
-            Evaluate on multiple angles:
-            1. Date Relevance: Does it match the specified date/timeframe?
-            2. Company Relevance: Is it about the specified company/service?
-            3. Incident Type: Is it about actual outages/incidents/technical problems?
-            4. Content Quality: Does it contain substantial incident information?
-            5. Source Credibility: Is it from a reliable technical/news source?
+            Multi-angle evaluation framework:
+            
+            1. INCIDENT PROCESS COMPLETENESS (0-10):
+               - Timeline clarity (start/end times, key milestones)
+               - Impact components (affected services, systems)
+               - Event sequence (what happened when)
+            
+            2. ROOT CAUSE DEPTH (0-10):
+               - Direct cause identification
+               - Root cause analysis depth
+               - Technical detail accuracy
+            
+            3. IMPACT SCOPE DETAIL (0-10):
+               - User impact quantification
+               - Service scope (which services affected)
+               - Geographic/duration specificity
+            
+            4. ACTIONABLE MEASURES (0-10):
+               - Prevention measures (before)
+               - Response measures (during)
+               - Recovery measures (after)
+            
+            5. SOURCE CREDIBILITY (0-10):
+               - Official status pages/postmortems
+               - Technical blogs/documentation
+               - News reliability and technical depth
             
             Return JSON with:
-            - "date_match": 0-10 (date alignment)
-            - "company_match": 0-10 (company/service alignment) 
-            - "incident_type": 0-10 (actual incident vs general info)
-            - "content_quality": 0-10 (depth of incident details)
-            - "source_credibility": 0-10 (reliability of source)
-            - "overall_score": 0-10 (weighted average)
-            - "reasoning": brief explanation
+            - "incident_completeness": 0-10 (timeline, components, sequence)
+            - "root_cause_depth": 0-10 (direct + root cause analysis)
+            - "impact_scope": 0-10 (users, services, geography, duration)
+            - "actionable_measures": 0-10 (prevention, response, recovery)
+            - "source_credibility": 0-10 (official sources, technical depth)
+            - "overall_score": 0-10 (weighted average: completeness 25%, cause 25%, impact 20%, measures 15%, credibility 15%)
+            - "incident_type": "availability/security/news/other"
+            - "is_duplicate": true/false (if similar to common incidents)
+            - "missing_info": ["list", "of", "missing", "elements"]
+            - "reasoning": "brief explanation of scoring"
             
-            Be strict: Only score 8+ for highly relevant incident information.
+            STRICT CRITERIA: Only score 8+ for comprehensive incident reports with clear timeline, root cause, and actionable details.
+            FOCUS: System availability incidents only, exclude security breaches and general news.
             """)
             
             try:
                 response = llm.invoke(prompt.format(query=query, content=content_sample))
+                log_llm_response(response.content, f"Eval-{i+1}")
                 result_json = extract_json_from_response(response.content)
                 
                 if result_json:
                     import json
                     evaluation = json.loads(result_json)
                     evaluation["result_index"] = i
+                    evaluation["url"] = result.get("url", "")
+                    evaluation["title"] = result.get("title", "")
                     results_evaluation.append(evaluation)
                 else:
                     results_evaluation.append({
-                        "result_index": i, "overall_score": 3, "reasoning": "Could not evaluate",
-                        "date_match": 3, "company_match": 3, "incident_type": 3, 
-                        "content_quality": 3, "source_credibility": 3
+                        "result_index": i, "overall_score": 2, "reasoning": "Could not evaluate",
+                        "incident_completeness": 2, "root_cause_depth": 2, "impact_scope": 2,
+                        "actionable_measures": 2, "source_credibility": 2, "incident_type": "other",
+                        "is_duplicate": False, "missing_info": ["evaluation_failed"],
+                        "url": result.get("url", ""), "title": result.get("title", "")
                     })
             except Exception as e:
                 logger.error(f"Individual result evaluation failed: {e}")
                 results_evaluation.append({
-                    "result_index": i, "overall_score": 3, "reasoning": "Evaluation failed",
-                    "date_match": 3, "company_match": 3, "incident_type": 3,
-                    "content_quality": 3, "source_credibility": 3
+                    "result_index": i, "overall_score": 1, "reasoning": "Evaluation error",
+                    "incident_completeness": 1, "root_cause_depth": 1, "impact_scope": 1,
+                    "actionable_measures": 1, "source_credibility": 1, "incident_type": "other",
+                    "is_duplicate": False, "missing_info": ["evaluation_error"],
+                    "url": result.get("url", ""), "title": result.get("title", "")
                 })
         
-        # Calculate overall metrics
+        # Calculate comprehensive metrics
         scores = [r.get("overall_score", 0) for r in results_evaluation]
         average_score = sum(scores) / len(scores) if scores else 0
         max_score = max(scores) if scores else 0
-        relevant_count = sum(1 for s in scores if s >= 7)
         
-        overall_relevant = average_score >= RELEVANCE_THRESHOLD or (max_score >= 8 and relevant_count >= 1)
+        # Filter for availability incidents only
+        availability_incidents = [r for r in results_evaluation if r.get("incident_type") == "availability"]
+        high_quality_count = sum(1 for s in scores if s >= 8)
+        recommended_reports = sorted([r for r in results_evaluation if r.get("overall_score", 0) >= 8], 
+                                   key=lambda x: x.get("overall_score", 0), reverse=True)
+        
+        # Overall relevance based on more reasonable criteria
+        overall_relevant = (average_score >= 5.0 or  # Raised threshold to trigger more keyword extraction
+                          (max_score >= 7 and high_quality_count >= 1) or  # Higher individual threshold
+                          (len(availability_incidents) >= 2 and max_score >= 5) or  # Multiple availability incidents
+                          (len(availability_incidents) >= 1 and max_score >= 6))  # Single good availability incident
         
         return {
             "overall_relevant": overall_relevant,
             "average_score": round(average_score, 1),
             "max_score": max_score,
-            "relevant_count": relevant_count,
+            "relevant_count": high_quality_count,
             "total_results": len(results),
+            "availability_incidents": len(availability_incidents),
+            "recommended_reports": recommended_reports,
             "results_scores": results_evaluation,
-            "reason": f"Avg: {average_score:.1f}, Max: {max_score}, Relevant: {relevant_count}/{len(results)}"
+            "reason": f"Avg: {average_score:.1f}, Max: {max_score}, Quality: {high_quality_count}/{len(results)}, Availability: {len(availability_incidents)}"
         }
         
     except Exception as e:
-        logger.error(f"Search results evaluation failed: {e}")
+        logger.error(f"Comprehensive evaluation failed: {e}")
         return {"overall_relevant": False, "average_score": 0, "results_scores": [], "reason": f"Evaluation error: {e}"}
 
+def extract_keywords_from_results(query: str, results: List[dict]) -> List[str]:
+    """Extract new keywords from search results for further searches"""
+    try:
+        if not results:
+            return []
+        
+        # Sample content from results
+        content_sample = "\n".join([
+            f"Title: {r.get('title', '')}\nContent: {r.get('content', '')[:200]}..."
+            for r in results[:3]
+        ])
+        
+        prompt = ChatPromptTemplate.from_template("""
+        Extract specific technical keywords from these search results that could help find more comprehensive incident information for: {query}
+        
+        Results:
+        {content}
+        
+        Extract keywords that are:
+        1. Technical terms (DNS, API, service names, error codes)
+        2. Incident-specific terms (postmortem, RCA, timeline, impact)
+        3. Company/service specific terms (service names, regions, components)
+        
+        Return JSON array of 3-5 new keywords that are NOT generic (avoid: outage, down, incident, disruption, failure)
+        Focus on specific technical terms that could find detailed incident reports.
+        
+        Example: ["DNS resolution", "postmortem", "us-east-1", "lambda timeout", "RCA"]
+        """)
+        
+        response = llm.invoke(prompt.format(query=query, content=content_sample))
+        log_llm_response(response.content, "KeywordExtract")
+        result_json = extract_json_from_response(response.content)
+        
+        if result_json:
+            import json
+            keywords = json.loads(result_json)
+            # Filter out existing keywords
+            new_keywords = [k for k in keywords if k.lower() not in [existing.lower() for existing in INCIDENT_KEYWORDS]]
+            logger.info(f"🔍 Extracted new keywords: {new_keywords}")
+            return new_keywords[:3]  # Limit to 3 new keywords
+        
+        return []
+        
+    except Exception as e:
+        logger.error(f"Keyword extraction failed: {e}")
+        return []
+
 def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int = 6) -> dict:
-    """Search with keyword pool and strict multi-angle evaluation"""
+    """Search with keyword pool and dynamic keyword extraction"""
     date_company = query_base  # e.g., "2025-10-20 amazon"
     best_result = None
     best_evaluation = {"average_score": 0}
+    used_keywords = []
     
+    # First try standard keywords
     for i, keyword in enumerate(INCIDENT_KEYWORDS[:max_attempts]):
         search_query = f"{date_company} {keyword}"
         logger.info(f"🔍 Trying '{keyword}' keyword ({i+1}/{max_attempts})")
+        used_keywords.append(keyword)
         
         result = provider_func(search_query)
         
@@ -383,14 +504,25 @@ def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int
             title = r.get("title", "No title")[:60] + "..." if len(r.get("title", "")) > 60 else r.get("title", "No title")
             logger.info(f"   {j+1}. {title}")
         
-        # Strict multi-angle evaluation
+        # Comprehensive multi-angle evaluation
         evaluation = evaluate_search_results_strict(search_query, result["results"])
         avg_score = evaluation.get("average_score", 0)
         max_score = evaluation.get("max_score", 0)
         relevant_count = evaluation.get("relevant_count", 0)
         total_count = evaluation.get("total_results", 0)
+        availability_count = evaluation.get("availability_incidents", 0)
+        recommended_count = len(evaluation.get("recommended_reports", []))
         
-        logger.info(f"⭐ Rating: Avg={avg_score:.1f}, Max={max_score}, Relevant={relevant_count}/{total_count}")
+        logger.info(f"⭐ Evaluation: Avg={avg_score:.1f}, Max={max_score}, Quality={relevant_count}/{total_count}, Availability={availability_count}, Recommended={recommended_count}")
+        
+        # Show top recommended reports
+        recommended = evaluation.get("recommended_reports", [])
+        if recommended:
+            logger.info(f"🏆 Top Reports:")
+            for j, report in enumerate(recommended[:2]):  # Show top 2
+                title = report.get("title", "No title")[:50] + "..." if len(report.get("title", "")) > 50 else report.get("title", "No title")
+                score = report.get("overall_score", 0)
+                logger.info(f"   {j+1}. [{score:.1f}/10] {title}")
         
         # Track best result even if not good enough
         if avg_score > best_evaluation.get("average_score", 0):
@@ -406,7 +538,42 @@ def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int
             result["evaluation"] = evaluation
             return result
         
-        logger.info(f"⚠️  Not relevant enough, trying next keyword")
+        # If relevant but not comprehensive, try extracting new keywords
+        if avg_score >= 1.5 and availability_count >= 1:  # Lower threshold to trigger more often
+            logger.info(f"🔄 Results relevant but not comprehensive - extracting new keywords")
+            new_keywords = extract_keywords_from_results(search_query, results)
+            
+            # Try new keywords (limited attempts)
+            for new_keyword in new_keywords[:2]:  # Try max 2 new keywords
+                if len(used_keywords) >= max_attempts + 2:  # Don't exceed total limit
+                    break
+                    
+                new_search_query = f"{date_company} {new_keyword}"
+                logger.info(f"🆕 Trying extracted keyword: '{new_keyword}'")
+                used_keywords.append(new_keyword)
+                
+                new_result = provider_func(new_search_query)
+                
+                if new_result.get("results") and not new_result.get("error"):
+                    new_evaluation = evaluate_search_results_strict(new_search_query, new_result["results"])
+                    new_avg_score = new_evaluation.get("average_score", 0)
+                    
+                    logger.info(f"⭐ New keyword result: Avg={new_avg_score:.1f}")
+                    
+                    if new_evaluation.get("overall_relevant", False):
+                        logger.info(f"✅ Excellent results with new keyword '{new_keyword}' - using these!")
+                        new_result["keyword_used"] = new_keyword
+                        new_result["evaluation"] = new_evaluation
+                        return new_result
+                    
+                    # Update best if better
+                    if new_avg_score > best_evaluation.get("average_score", 0):
+                        best_result = new_result
+                        best_result["keyword_used"] = new_keyword
+                        best_result["evaluation"] = new_evaluation
+                        best_evaluation = new_evaluation
+        
+        logger.info(f"⚠️  Not comprehensive enough, trying next keyword")
     
     # All keywords exhausted - return best result with evaluation details
     if best_result:
@@ -487,7 +654,7 @@ def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int
         return {"query": query, "results": [], "error": str(e), "provider": "brave"}
 
 def tc_search(query: str) -> dict:
-    """Search using TC Cloud API with official SDK"""
+    """Search using TC Cloud API with smart site targeting"""
     try:
         logger.debug(f"TC search starting for: {query}")
         
@@ -498,54 +665,55 @@ def tc_search(query: str) -> dict:
             logger.debug("TC API credentials not found")
             return {"query": query, "results": [], "error": "Missing credentials", "provider": "tc"}
         
-        # Initialize credentials
+        # Initialize credentials and client
         cred = credential.Credential(secret_id, secret_key)
-        
-        # Configure HTTP profile
         httpProfile = HttpProfile()
         httpProfile.endpoint = "wsa.tencentcloudapi.com"
-        
-        # Configure client profile
         clientProfile = ClientProfile()
         clientProfile.httpProfile = httpProfile
-        
-        # Initialize client
         client = wsa_client.WsaClient(cred, "", clientProfile)
         
-        # Create request
-        req = models.SearchProRequest()
-        params = {
-            "Query": f"{query} site:status.microsoft.com OR site:surfingcomplexity.blog OR site:aws.amazon.com OR site:health.aws.amazon.com OR site:news.ycombinator.com OR site:github.com OR site:status.aws.amazon.com OR site:reddit.com",
-            "Mode": 0  # Natural search
-        }
-        req.from_json_string(json.dumps(params))
+        # Try with site restrictions first
+        site_queries = [
+            f"{query} site:aws.amazon.com OR site:status.aws.amazon.com OR site:github.com OR site:reddit.com OR site:news.ycombinator.com",
+            query  # Fallback without site restrictions
+        ]
         
-        # Execute search
-        resp = client.SearchPro(req)
-        response_data = json.loads(resp.to_json_string())
-        
-        # Parse results
-        results = []
-        pages = response_data.get("Pages")
-        
-        if pages is None:
-            logger.debug("TC search returned no Pages field")
-            return {"query": query, "results": [], "error": "No results", "provider": "tc"}
-        
-        for page_json in pages:
-            try:
-                page = json.loads(page_json)
-                results.append({
-                    "title": page.get("title", ""),
-                    "url": page.get("url", ""),
-                    "content": page.get("passage", ""),
-                    "score": page.get("score", 0)
-                })
-            except json.JSONDecodeError:
+        for i, search_query in enumerate(site_queries):
+            logger.debug(f"TC search attempt {i+1}: {'with sites' if i == 0 else 'without sites'}")
+            
+            req = models.SearchProRequest()
+            params = {"Query": search_query, "Mode": 0}
+            req.from_json_string(json.dumps(params))
+            
+            resp = client.SearchPro(req)
+            response_data = json.loads(resp.to_json_string())
+            
+            pages = response_data.get("Pages")
+            if pages is None:
                 continue
+                
+            results = []
+            for page_json in pages:
+                try:
+                    page = json.loads(page_json)
+                    results.append({
+                        "title": page.get("title", ""),
+                        "url": page.get("url", ""),
+                        "content": page.get("passage", ""),
+                        "score": page.get("score", 0)
+                    })
+                except json.JSONDecodeError:
+                    continue
+            
+            # If we got decent results, use them
+            if len(results) >= 3:
+                logger.info(f"📊 TC Search: {len(results)} results found ({'with sites' if i == 0 else 'no restrictions'})")
+                return {"query": query, "results": results, "provider": "tc"}
         
-        logger.info(f"📊 TC Search: {len(results)} results found")
-        return {"query": query, "results": results, "provider": "tc"}
+        # No good results from either approach
+        logger.info(f"📊 TC Search: No results found")
+        return {"query": query, "results": [], "error": "No results", "provider": "tc"}
         
     except TencentCloudSDKException as e:
         logger.error(f"TC SDK exception: {e}")
@@ -649,12 +817,12 @@ def search_with_fallback(query: str) -> dict:
                     logger.info(f"✅ TC Search: Excellent results (avg: {avg_score:.1f})")
                     cache_result(query, result)
                     return result
-                elif avg_score >= RELEVANCE_THRESHOLD:
+                elif avg_score >= 3.0:  # Lower threshold
                     logger.info(f"✅ TC Search: Good results (avg: {avg_score:.1f})")
                     cache_result(query, result)
                     return result
                 else:
-                    logger.info(f"⚠️  TC Search: Below threshold (avg: {avg_score:.1f} < {RELEVANCE_THRESHOLD})")
+                    logger.info(f"⚠️  TC Search: Below threshold (avg: {avg_score:.1f} < 3.0)")
             elif result.get("error") == "Keywords exhausted":
                 logger.info("⚠️  TC Search: All keywords exhausted")
             else:
@@ -674,12 +842,12 @@ def search_with_fallback(query: str) -> dict:
                     logger.info(f"✅ Brave Search: Excellent results (avg: {avg_score:.1f})")
                     cache_result(query, result)
                     return result
-                elif avg_score >= RELEVANCE_THRESHOLD:
+                elif avg_score >= 3.0:  # Lower threshold
                     logger.info(f"✅ Brave Search: Good results (avg: {avg_score:.1f})")
                     cache_result(query, result)
                     return result
                 else:
-                    logger.info(f"⚠️  Brave Search: Below threshold (avg: {avg_score:.1f} < {RELEVANCE_THRESHOLD})")
+                    logger.info(f"⚠️  Brave Search: Below threshold (avg: {avg_score:.1f} < 3.0)")
             elif result.get("error") == "Keywords exhausted":
                 logger.info("⚠️  Brave Search: All keywords exhausted")
             else:
@@ -954,7 +1122,25 @@ def search_node(state: IncidentState) -> dict:
             avg_score = evaluation.get("average_score", 0)
             relevant_count = evaluation.get("relevant_count", 0)
             total_count = evaluation.get("total_results", 0)
-            logger.info(f"📊 Final Results: {provider} | '{keyword_used}' | Score: {avg_score:.1f} | Relevant: {relevant_count}/{total_count}")
+            availability_count = evaluation.get("availability_incidents", 0)
+            recommended_count = len(evaluation.get("recommended_reports", []))
+            
+            # Determine relevance and comprehensiveness
+            relevance = "High" if avg_score >= 6 else "Medium" if avg_score >= 3 else "Low"
+            comprehensiveness = "Complete" if recommended_count > 0 else "Partial" if availability_count > 0 else "Limited"
+            
+            logger.info(f"📊 Final Results: {provider} | '{keyword_used}' | Score: {avg_score:.1f} | Relevance: {relevance} | Comprehensiveness: {comprehensiveness}")
+            logger.info(f"📈 Details: Quality: {relevant_count}/{total_count} | Availability: {availability_count} | Recommended: {recommended_count}")
+            
+            # Show final recommended reports
+            recommended = evaluation.get("recommended_reports", [])
+            if recommended:
+                logger.info(f"📋 Recommended Reports ({len(recommended)}):")
+                for j, report in enumerate(recommended[:3]):  # Show top 3
+                    title = report.get("title", "No title")[:60] + "..." if len(report.get("title", "")) > 60 else report.get("title", "No title")
+                    score = report.get("overall_score", 0)
+                    incident_type = report.get("incident_type", "unknown")
+                    logger.info(f"   {j+1}. [{score:.1f}/10] [{incident_type}] {title}")
         
         progress_update = update_progress(state, "search_complete", search_complete=True)
         
