@@ -211,6 +211,211 @@ def brave_search_with_rate_limit(query: str) -> dict:
         logger.info(f"Rate limiting: sleeping {sleep_time:.2f}s")
         time.sleep(sleep_time)
     
+    last_brave_request_time = time.time()
+    
+    try:
+        brave_api_key = os.getenv("BRAVE_API_KEY")
+        logger.info(f"Using Brave API key: {mask_api_key(brave_api_key)}")
+        
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": brave_api_key
+        }
+        
+        params = {
+            "q": query,
+            "count": 3,
+            "search_lang": "en",
+            "country": "US",
+            "safesearch": "moderate"
+        }
+        
+        logger.info(f"Brave API request: {params}")
+        
+        response = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers=headers,
+            params=params,
+            timeout=10
+        )
+        
+        logger.info(f"Brave API response: {response.status_code}")
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if "web" in data and "results" in data["web"]:
+            results = []
+            for item in data["web"]["results"]:
+                results.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "content": item.get("description", "")
+                })
+            
+            logger.info(f"Brave search success: {len(results)} results")
+            return {
+                "query": query,
+                "results": results,
+                "provider": "brave"
+            }
+        else:
+            logger.warning("Brave API returned unexpected format")
+            return {"query": query, "results": [], "error": "Unexpected response format", "provider": "brave"}
+            
+    except Exception as e:
+        logger.error(f"Brave search exception: {e}")
+        return {"query": query, "results": [], "error": str(e), "provider": "brave"}
+
+# Search keyword pools by priority (most specific to general)
+INCIDENT_KEYWORDS = [
+    "outage", "down", "incident", "disruption", "failure", 
+    "unavailable", "postmortem", "service degradation", "issue",
+    "maintenance", "problem", "error"
+]
+
+RELEVANCE_THRESHOLD = 7.0  # Minimum average relevance score to accept results
+
+def evaluate_search_results_strict(query: str, results: List[dict]) -> dict:
+    """Strict multi-angle evaluation of each search result"""
+    try:
+        if not results:
+            return {"overall_relevant": False, "average_score": 0, "results_scores": [], "reason": "No results"}
+        
+        # Evaluate each result individually
+        results_evaluation = []
+        
+        for i, result in enumerate(results):
+            content_sample = f"Title: {result.get('title', '')}\nURL: {result.get('url', '')}\nContent: {result.get('content', '')[:300]}..."
+            
+            prompt = ChatPromptTemplate.from_template("""
+            Evaluate this search result for relevance to: {query}
+            
+            Result:
+            {content}
+            
+            Evaluate on multiple angles:
+            1. Date Relevance: Does it match the specified date/timeframe?
+            2. Company Relevance: Is it about the specified company/service?
+            3. Incident Type: Is it about actual outages/incidents/technical problems?
+            4. Content Quality: Does it contain substantial incident information?
+            5. Source Credibility: Is it from a reliable technical/news source?
+            
+            Return JSON with:
+            - "date_match": 0-10 (date alignment)
+            - "company_match": 0-10 (company/service alignment) 
+            - "incident_type": 0-10 (actual incident vs general info)
+            - "content_quality": 0-10 (depth of incident details)
+            - "source_credibility": 0-10 (reliability of source)
+            - "overall_score": 0-10 (weighted average)
+            - "reasoning": brief explanation
+            
+            Be strict: Only score 8+ for highly relevant incident information.
+            """)
+            
+            try:
+                response = llm.invoke(prompt.format(query=query, content=content_sample))
+                result_json = extract_json_from_response(response.content)
+                
+                if result_json:
+                    import json
+                    evaluation = json.loads(result_json)
+                    evaluation["result_index"] = i
+                    results_evaluation.append(evaluation)
+                else:
+                    results_evaluation.append({
+                        "result_index": i, "overall_score": 3, "reasoning": "Could not evaluate",
+                        "date_match": 3, "company_match": 3, "incident_type": 3, 
+                        "content_quality": 3, "source_credibility": 3
+                    })
+            except Exception as e:
+                logger.error(f"Individual result evaluation failed: {e}")
+                results_evaluation.append({
+                    "result_index": i, "overall_score": 3, "reasoning": "Evaluation failed",
+                    "date_match": 3, "company_match": 3, "incident_type": 3,
+                    "content_quality": 3, "source_credibility": 3
+                })
+        
+        # Calculate overall metrics
+        scores = [r.get("overall_score", 0) for r in results_evaluation]
+        average_score = sum(scores) / len(scores) if scores else 0
+        max_score = max(scores) if scores else 0
+        relevant_count = sum(1 for s in scores if s >= 7)
+        
+        overall_relevant = average_score >= RELEVANCE_THRESHOLD or (max_score >= 8 and relevant_count >= 1)
+        
+        return {
+            "overall_relevant": overall_relevant,
+            "average_score": round(average_score, 1),
+            "max_score": max_score,
+            "relevant_count": relevant_count,
+            "total_results": len(results),
+            "results_scores": results_evaluation,
+            "reason": f"Avg: {average_score:.1f}, Max: {max_score}, Relevant: {relevant_count}/{len(results)}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Search results evaluation failed: {e}")
+        return {"overall_relevant": False, "average_score": 0, "results_scores": [], "reason": f"Evaluation error: {e}"}
+
+def smart_search_with_keywords(query_base: str, provider_func, max_attempts: int = 6) -> dict:
+    """Search with keyword pool and strict multi-angle evaluation"""
+    date_company = query_base  # e.g., "2025-10-20 amazon"
+    best_result = None
+    best_evaluation = {"average_score": 0}
+    
+    for i, keyword in enumerate(INCIDENT_KEYWORDS[:max_attempts]):
+        search_query = f"{date_company} {keyword}"
+        logger.info(f"Trying keyword {i+1}/{max_attempts}: '{keyword}' -> '{search_query}'")
+        
+        result = provider_func(search_query)
+        
+        # If search failed or empty, try next keyword
+        if result.get("error") or not result.get("results"):
+            logger.info(f"Keyword '{keyword}' failed or empty, trying next")
+            continue
+        
+        # Strict multi-angle evaluation
+        evaluation = evaluate_search_results_strict(search_query, result["results"])
+        logger.info(f"Evaluation: {evaluation['reason']} | Relevant: {evaluation['overall_relevant']}")
+        
+        # Track best result even if not good enough
+        if evaluation.get("average_score", 0) > best_evaluation.get("average_score", 0):
+            best_result = result
+            best_result["keyword_used"] = keyword
+            best_result["evaluation"] = evaluation
+            best_evaluation = evaluation
+        
+        # If good enough, use these results
+        if evaluation.get("overall_relevant", False):
+            logger.info(f"Excellent results found with keyword '{keyword}' (avg: {evaluation.get('average_score')})")
+            result["keyword_used"] = keyword
+            result["evaluation"] = evaluation
+            return result
+        
+        logger.info(f"Results not relevant enough, trying next keyword")
+    
+    # All keywords exhausted - return best result with evaluation details
+    if best_result:
+        logger.warning(f"Keywords exhausted. Best result: avg={best_evaluation.get('average_score')}, threshold={RELEVANCE_THRESHOLD}")
+        return best_result
+    else:
+        logger.warning("All keywords exhausted, no results found")
+        return {"query": query_base, "results": [], "error": "Keywords exhausted", "provider": "unknown"}
+    """Search using Brave API with rate limiting (1 req/sec)"""
+    global last_brave_request_time
+    
+    logger.info(f"Brave search starting for: {query}")
+    
+    # Rate limiting: ensure 1 second between requests
+    current_time = time.time()
+    time_since_last = current_time - last_brave_request_time
+    if time_since_last < 1.0:
+        sleep_time = 1.0 - time_since_last
+        logger.info(f"Rate limiting: sleeping {sleep_time:.2f}s")
+        time.sleep(sleep_time)
+    
     try:
         api_key = os.getenv("BRAVE_API_KEY")
         logger.info(f"Using Brave API key: {mask_api_key(api_key)}")
@@ -298,7 +503,7 @@ def tc_search(query: str) -> dict:
         # Create request
         req = models.SearchProRequest()
         params = {
-            "Query": f"{query} site:github.com OR site:status.aws.amazon.com OR site:reddit.com",
+            "Query": f"{query} site:status.microsoft.com OR site:surfingcomplexity.blog OR site:aws.amazon.com OR site:health.aws.amazon.com OR site:news.ycombinator.com OR site:github.com OR site:status.aws.amazon.com OR site:reddit.com",
             "Mode": 0  # Natural search
         }
         req.from_json_string(json.dumps(params))
@@ -413,42 +618,74 @@ def parse_natural_input(input_text: str) -> InputParsing:
 
 @tool
 def search_with_fallback(query: str) -> dict:
-    """Search using TC (primary), Brave, or Tavily with caching and error handling"""
+    """Search using TC (primary), Brave, or Tavily with strict evaluation and provider fallback"""
     try:
         # Check cache first
         cached = get_cached_result(query)
         if cached:
             return {"query": query, "results": cached["results"], "cached": True, "provider": cached.get("provider", "cache")}
         
-        # Try TC search first
+        # Try TC search first with smart keywords
         if os.getenv("TC_SECRET_ID") and os.getenv("TC_SECRET_KEY"):
-            result = tc_search(query)
-            if result.get("results"):  # Success
-                cache_result(query, result)
-                return result
+            logger.info("Trying TC search with keyword strategy")
+            result = smart_search_with_keywords(query, tc_search, max_attempts=4)
+            
+            if result.get("results") and not result.get("error"):
+                evaluation = result.get("evaluation", {})
+                if evaluation.get("overall_relevant", False):
+                    logger.info(f"TC search: Excellent results found (avg: {evaluation.get('average_score')})")
+                    cache_result(query, result)
+                    return result
+                elif evaluation.get("average_score", 0) >= RELEVANCE_THRESHOLD:
+                    logger.info(f"TC search: Good results found (avg: {evaluation.get('average_score')})")
+                    cache_result(query, result)
+                    return result
+                else:
+                    logger.warning(f"TC search: Results below threshold (avg: {evaluation.get('average_score'):.1f} < {RELEVANCE_THRESHOLD}), trying next provider")
+            elif result.get("error") == "Keywords exhausted":
+                logger.warning("TC search: All keywords exhausted, trying next provider")
             else:
                 logger.warning("TC search failed, trying Brave fallback")
         
-        # Try Brave search as first fallback (if enabled and API key available)
+        # Try Brave search as first fallback
         use_brave = os.getenv("USE_BRAVE_SEARCH", "true").lower() == "true"
         
         if use_brave and os.getenv("BRAVE_API_KEY"):
-            result = brave_search_with_rate_limit(query)
-            if result.get("results"):  # Success
-                cache_result(query, result)
-                return result
+            logger.info("Trying Brave search with keyword strategy")
+            result = smart_search_with_keywords(query, brave_search_with_rate_limit, max_attempts=4)
+            
+            if result.get("results") and not result.get("error"):
+                evaluation = result.get("evaluation", {})
+                if evaluation.get("overall_relevant", False):
+                    logger.info(f"Brave search: Excellent results found (avg: {evaluation.get('average_score')})")
+                    cache_result(query, result)
+                    return result
+                elif evaluation.get("average_score", 0) >= RELEVANCE_THRESHOLD:
+                    logger.info(f"Brave search: Good results found (avg: {evaluation.get('average_score')})")
+                    cache_result(query, result)
+                    return result
+                else:
+                    logger.warning(f"Brave search: Results below threshold (avg: {evaluation.get('average_score'):.1f} < {RELEVANCE_THRESHOLD}), trying next provider")
+            elif result.get("error") == "Keywords exhausted":
+                logger.warning("Brave search: All keywords exhausted, trying next provider")
             else:
                 logger.warning("Brave search failed, trying Tavily fallback")
         
         # Fallback to Tavily
         if os.getenv("TAVILY_API_KEY"):
-            result = tavily_search_fallback(query)
-            if result.get("results"):
+            logger.info("Trying Tavily search with keyword strategy")
+            result = smart_search_with_keywords(query, tavily_search_fallback, max_attempts=4)
+            
+            if result.get("results") and not result.get("error"):
+                evaluation = result.get("evaluation", {})
+                logger.info(f"Tavily search: Final attempt (avg: {evaluation.get('average_score', 0):.1f})")
                 cache_result(query, result)
                 return result
+            elif result.get("error") == "Keywords exhausted":
+                logger.warning("Tavily search: All keywords exhausted")
         
-        # No results from any provider
-        return {"query": query, "results": [], "error": "No search providers available", "cached": False}
+        # No relevant results from any provider
+        return {"query": query, "results": [], "error": "No relevant results from any provider", "cached": False}
         
     except Exception as e:
         logger.error(f"Search failed for '{query}': {e}")
@@ -669,37 +906,35 @@ def parse_node(state: IncidentState) -> dict:
         }
 
 def search_node(state: IncidentState) -> dict:
-    """Enhanced search with progress tracking and error handling"""
+    """Enhanced search with keyword strategy and relevance evaluation"""
     try:
-        # Generate search queries
-        base_query = f"{state['date']} incident"
+        # Generate base search query (date + company + description)
+        base_query = f"{state['date']}"
         if state.get("company"):
             base_query += f" {state['company']}"
         if state.get("incident_description"):
             base_query += f" {state['incident_description']}"
         
-        queries = [
-            base_query,
-            f"{base_query} outage postmortem",
-            f"{base_query} root cause analysis"
-        ]
+        logger.info(f"Starting smart search with base query: {base_query}")
         
-        results = []
-        keywords = []
+        # Single smart search with keyword strategy
+        result = search_with_fallback.invoke({"query": base_query})
+        
+        results = [result]
+        keywords = base_query.split()
         errors = []
         
-        for query in queries:
-            result = search_with_fallback.invoke({"query": query})
-            results.append(result)
-            keywords.extend(query.split())
-            
-            if "error" in result:
-                errors.append(f"Search error: {result['error']}")
-            
-            # Log search provider used
-            provider = result.get("provider", "unknown")
-            cached = result.get("cached", False)
-            logger.info(f"Search: {query[:50]}... | Provider: {provider} | Cached: {cached}")
+        if "error" in result:
+            errors.append(f"Search error: {result['error']}")
+        
+        # Log search details
+        provider = result.get("provider", "unknown")
+        cached = result.get("cached", False)
+        keyword_used = result.get("keyword_used", "none")
+        evaluation = result.get("evaluation", {})
+        
+        logger.info(f"Search complete: Provider: {provider} | Cached: {cached} | Keyword: {keyword_used}")
+        logger.info(f"Evaluation: {evaluation.get('reason', 'N/A')} | Relevant: {evaluation.get('overall_relevant', False)}")
         
         progress_update = update_progress(state, "search_complete", search_complete=True)
         
