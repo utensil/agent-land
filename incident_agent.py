@@ -837,30 +837,7 @@ def search_with_fallback(query: str) -> dict:
             cached_result["evaluation"] = evaluation
             return cached_result
         
-        # Try TC search first with smart keywords
-        if os.getenv("TC_SECRET_ID") and os.getenv("TC_SECRET_KEY"):
-            logger.info("🔍 Trying TC Search...")
-            result = smart_search_with_keywords(query, tc_search, max_attempts=4)
-            
-            if result.get("results") and not result.get("error"):
-                evaluation = result.get("evaluation", {})
-                avg_score = evaluation.get("average_score", 0)
-                if evaluation.get("overall_relevant", False):
-                    logger.info(f"✅ TC Search: Excellent results (avg: {avg_score:.1f})")
-                    cache_result(query, result)
-                    return result
-                elif avg_score >= 3.0:  # Lower threshold
-                    logger.info(f"✅ TC Search: Good results (avg: {avg_score:.1f})")
-                    cache_result(query, result)
-                    return result
-                else:
-                    logger.info(f"⚠️  TC Search: Below threshold (avg: {avg_score:.1f} < 3.0)")
-            elif result.get("error") == "Keywords exhausted":
-                logger.info("⚠️  TC Search: All keywords exhausted")
-            else:
-                logger.info("❌ TC Search: Failed")
-        
-        # Try Brave search as first fallback
+        # Try Brave search first
         use_brave = os.getenv("USE_BRAVE_SEARCH", "true").lower() == "true"
         
         if use_brave and os.getenv("BRAVE_API_KEY"):
@@ -885,19 +862,42 @@ def search_with_fallback(query: str) -> dict:
             else:
                 logger.info("❌ Brave Search: Failed")
         
-        # Fallback to Tavily
+        # Try Tavily search as second fallback
         if os.getenv("TAVILY_API_KEY"):
-            logger.info("🔍 Trying Tavily Search (final attempt)...")
+            logger.info("🔍 Trying Tavily Search...")
             result = smart_search_with_keywords(query, tavily_search_fallback, max_attempts=4)
             
             if result.get("results") and not result.get("error"):
                 evaluation = result.get("evaluation", {})
                 avg_score = evaluation.get("average_score", 0)
-                logger.info(f"📊 Tavily Search: Final results (avg: {avg_score:.1f})")
+                if evaluation.get("overall_relevant", False):
+                    logger.info(f"✅ Tavily Search: Excellent results (avg: {avg_score:.1f})")
+                    cache_result(query, result)
+                    return result
+                elif avg_score >= 3.0:  # Lower threshold
+                    logger.info(f"✅ Tavily Search: Good results (avg: {avg_score:.1f})")
+                    cache_result(query, result)
+                    return result
+                else:
+                    logger.info(f"⚠️  Tavily Search: Below threshold (avg: {avg_score:.1f} < 3.0)")
+            elif result.get("error") == "Keywords exhausted":
+                logger.info("⚠️  Tavily Search: All keywords exhausted")
+            else:
+                logger.info("❌ Tavily Search: Failed")
+        
+        # Fallback to TC search (final attempt)
+        if os.getenv("TC_SECRET_ID") and os.getenv("TC_SECRET_KEY"):
+            logger.info("🔍 Trying TC Search (final attempt)...")
+            result = smart_search_with_keywords(query, tc_search, max_attempts=4)
+            
+            if result.get("results") and not result.get("error"):
+                evaluation = result.get("evaluation", {})
+                avg_score = evaluation.get("average_score", 0)
+                logger.info(f"📊 TC Search: Final results (avg: {avg_score:.1f})")
                 cache_result(query, result)
                 return result
             elif result.get("error") == "Keywords exhausted":
-                logger.info("⚠️  Tavily Search: All keywords exhausted")
+                logger.info("⚠️  TC Search: All keywords exhausted")
         
         # No relevant results from any provider
         return {"query": query, "results": [], "error": "No relevant results from any provider", "cached": False}
@@ -1008,17 +1008,32 @@ def generate_structured_report(search_data: str, metadata: dict, timeline: List[
         Metadata: {metadata}
         Timeline: {timeline}
         
-        Return ONLY a JSON object with these fields:
-        - "incident_name": Format as "{{company}} on YYYY-MM-DD due to [cause] affecting [services]"
-        - "company_product": Simple string with company and product name (e.g., "CrowdStrike Falcon Sensor")
-        - "incident_time": Start time in YYYY-MM-DD HH:MM:SS format (use available data or estimate)
-        - "report_links": Array of original report URLs from search results
-        - "impact_description": Geographic regions, user count, service scope, duration in markdown format
-        - "incident_process": Timeline with three phases in markdown format
-        - "root_cause": Direct and root causes in markdown format  
-        - "improvement_measures": Prevention and response measures in markdown format
+        Return ONLY a JSON object following this exact structure:
         
-        Use markdown formatting for multi-line fields. Extract URLs from search data for report_links.
+        1. "incident_name": Format as "{{company}} on YYYY-MM-DD due to [XX cause] affecting [affected services] failure"
+        2. "company_product": Company and product name
+        3. "incident_time": Incident start time in YYYY-MM-DD HH:MM:SS format
+        4. "report_links": Array of accessible and credible incident report URLs from search data
+        5. "impact_description": Markdown describing geographic regions, user count, service scope, and duration
+        6. "incident_process": Markdown with three phases and specific timestamps:
+           ## Trigger Phase
+           - Key trigger time points and triggering factors
+           ## Spread Phase
+           - Impact expansion process, gradual service interruption spread
+           ## Response & Recovery Phase
+           - Technical team reactions, response measures, and recovery process
+        7. "root_cause": Markdown with two levels:
+           ## Direct Cause
+           - Incident trigger, immediate cause
+           ## Root Cause
+           - Deeper technical, process, or management issues (describe very clearly)
+        8. "improvement_measures": Markdown with two categories:
+           ## Prevention Measures
+           - Failure avoidance measures, system and process construction
+           ## Response Measures
+           - Improvements to incident response capability: detection, diagnosis, handling
+        
+        Extract real URLs from search data for report_links. Use markdown formatting for all multi-line fields.
         """)
         
         response = llm.invoke(prompt.format(
@@ -1261,7 +1276,28 @@ def generate_node(state: IncidentState) -> dict:
         progress_update = update_progress(state, "report_generated", report_generated=True)
         
         return {
-            "incident_report": f"# {report.incident_name}\n\n**Company/Product:** {report.company_product}\n\n**Incident Time:** {report.incident_time}\n\n## Impact\n{report.impact_description}\n\n## Incident Process\n{report.incident_process}\n\n## Root Cause\n{report.root_cause}\n\n## Improvement Measures\n{report.improvement_measures}",
+            "incident_report": f"""# {report.incident_name}
+
+## Company & Product
+{report.company_product}
+
+## Incident Time
+{report.incident_time}
+
+## Report Links
+{chr(10).join(f"- {link}" for link in report.report_links) if report.report_links else "- No direct report links available"}
+
+## Impact Description
+{report.impact_description}
+
+## Incident Process
+{report.incident_process}
+
+## Root Cause
+{report.root_cause}
+
+## Improvement Measures
+{report.improvement_measures}""",
             **progress_update
         }
         
